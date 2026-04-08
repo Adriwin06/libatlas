@@ -2,11 +2,13 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "asset_store.hpp"
 #include "picojson.h"
 
 #include "libatlas/libatlas.hpp"
@@ -20,6 +22,7 @@ struct ExtractCommand {
   fs::path requests_path;
   fs::path output_dir;
   fs::path metadata_path;
+  fs::path asset_store_dir;
   libatlas::UvOrigin origin = libatlas::UvOrigin::TopLeft;
   libatlas::UvRoundingPolicy rounding = libatlas::UvRoundingPolicy::Expand;
   bool trim = true;
@@ -164,6 +167,10 @@ picojson::value to_json_metadata(const libatlas::ExtractionMetadata& metadata) {
   object["source_atlas_identifier"] = picojson::value(metadata.source_atlas_identifier);
   object["source_atlas_width"] = picojson::value(static_cast<double>(metadata.source_atlas_width));
   object["source_atlas_height"] = picojson::value(static_cast<double>(metadata.source_atlas_height));
+  object["trim_transparent_borders_applied"] =
+      picojson::value(metadata.trim_transparent_borders_applied);
+  object["transparent_alpha_threshold"] =
+      picojson::value(static_cast<double>(metadata.transparent_alpha_threshold));
   object["requested_uv_rect"] = to_json_uv(metadata.requested_uv_rect);
   object["resolved_pixel_rect"] = to_json_rect(metadata.resolved_pixel_rect);
   object["clamped_pixel_rect"] = to_json_rect(metadata.clamped_pixel_rect);
@@ -175,7 +182,10 @@ picojson::value to_json_metadata(const libatlas::ExtractionMetadata& metadata) {
   object["trimmed_height"] = picojson::value(static_cast<double>(metadata.trimmed_height));
   object["cropped_alpha_coverage"] = picojson::value(metadata.cropped_alpha_coverage);
   object["trimmed_alpha_coverage"] = picojson::value(metadata.trimmed_alpha_coverage);
+  object["cropped_exact_id"] = picojson::value(metadata.cropped_exact_id.to_string());
   object["exact_id"] = picojson::value(metadata.exact_id.to_string());
+  object["cache_outcome"] =
+      picojson::value(libatlas::identity_cache_outcome_to_string(metadata.cache_outcome));
 
   picojson::array warnings;
   for (const auto warning : metadata.warnings) {
@@ -186,6 +196,21 @@ picojson::value to_json_metadata(const libatlas::ExtractionMetadata& metadata) {
   if (metadata.has_similarity_signature) {
     object["similarity_signature"] = to_json_similarity(metadata.similarity_signature);
   }
+  return picojson::value(object);
+}
+
+picojson::value to_json_asset_store_paths(const libatlas_tool::StoredAssetPaths& stored) {
+  picojson::object object;
+  object["atlas_image"] = picojson::value(stored.atlas_image_path.generic_string());
+  object["atlas_metadata"] = picojson::value(stored.atlas_metadata_path.generic_string());
+  object["cropped_image"] = picojson::value(stored.cropped_image_path.generic_string());
+  object["cropped_metadata"] = picojson::value(stored.cropped_metadata_path.generic_string());
+  object["canonical_image"] = picojson::value(stored.canonical_image_path.generic_string());
+  object["canonical_metadata"] = picojson::value(stored.canonical_metadata_path.generic_string());
+  object["occurrence_metadata"] = picojson::value(stored.occurrence_metadata_path.generic_string());
+  object["atlas_existed"] = picojson::value(stored.atlas_existed);
+  object["cropped_existed"] = picojson::value(stored.cropped_existed);
+  object["canonical_existed"] = picojson::value(stored.canonical_existed);
   return picojson::value(object);
 }
 
@@ -224,6 +249,8 @@ ExtractCommand parse_extract_command(int argc, char** argv) {
       command.output_dir = argv[++index];
     } else if (argument == "--metadata" && index + 1 < argc) {
       command.metadata_path = argv[++index];
+    } else if (argument == "--asset-store" && index + 1 < argc) {
+      command.asset_store_dir = argv[++index];
     } else if (argument == "--origin" && index + 1 < argc) {
       command.origin = parse_origin(argv[++index]);
     } else if (argument == "--rounding" && index + 1 < argc) {
@@ -283,6 +310,16 @@ void run_extract(const ExtractCommand& command) {
     throw std::runtime_error(atlas.error().message);
   }
 
+  std::optional<libatlas_tool::AssetStore> asset_store;
+  libatlas::ExtractionIdentityCache identity_cache;
+  if (!command.asset_store_dir.empty()) {
+    asset_store.emplace(command.asset_store_dir);
+    auto preload = asset_store->preload_cache(identity_cache);
+    if (!preload) {
+      throw std::runtime_error(preload.error().message);
+    }
+  }
+
   const picojson::object root =
       require_object(load_json_file(command.requests_path), "extract request root");
   const std::string atlas_identifier = optional_string(root, "atlas_identifier").empty()
@@ -305,15 +342,16 @@ void run_extract(const ExtractCommand& command) {
     options.trim_transparent_borders = command.trim;
     options.transparent_alpha_threshold = command.alpha_threshold;
 
-    auto extracted = libatlas::extract_texture(
-        atlas.value(),
-        libatlas::UvRect{
-            require_number(uv, "x_min", context + ".uv"),
-            require_number(uv, "x_max", context + ".uv"),
-            require_number(uv, "y_min", context + ".uv"),
-            require_number(uv, "y_max", context + ".uv"),
-        },
-        options);
+    const libatlas::UvRect uv_rect{
+        require_number(uv, "x_min", context + ".uv"),
+        require_number(uv, "x_max", context + ".uv"),
+        require_number(uv, "y_min", context + ".uv"),
+        require_number(uv, "y_max", context + ".uv"),
+    };
+
+    auto extracted = asset_store
+                         ? libatlas::extract_texture_cached(atlas.value(), uv_rect, options, &identity_cache)
+                         : libatlas::extract_texture(atlas.value(), uv_rect, options);
     if (!extracted) {
       throw std::runtime_error(extracted.error().message);
     }
@@ -340,6 +378,17 @@ void run_extract(const ExtractCommand& command) {
       output_item["trimmed_image"] = picojson::value(trimmed_path.generic_string());
     }
     output_item["metadata"] = to_json_metadata(extracted.value().metadata);
+    if (asset_store) {
+      auto stored = asset_store->record_occurrence(name,
+                                                   command.atlas_path.string(),
+                                                   atlas_identifier,
+                                                   atlas.value(),
+                                                   extracted.value());
+      if (!stored) {
+        throw std::runtime_error(stored.error().message);
+      }
+      output_item["asset_store"] = to_json_asset_store_paths(stored.value());
+    }
     output_items.emplace_back(output_item);
   }
 
@@ -422,8 +471,8 @@ void run_pack(const PackCommand& command) {
 void print_usage() {
   std::cout
       << "libatlas_tool extract --atlas atlas.png --requests requests.json --output-dir out "
-         "--metadata metadata.json [--origin top-left|bottom-left] [--rounding expand|nearest|contract] "
-         "[--no-trim] [--alpha-threshold N]\n"
+         "--metadata metadata.json [--asset-store DIR] [--origin top-left|bottom-left] "
+         "[--rounding expand|nearest|contract] [--no-trim] [--alpha-threshold N]\n"
       << "libatlas_tool pack --manifest pack.json --output-dir out --metadata metadata.json "
          "[--atlas-prefix atlas] [--max-width N] [--max-height N] [--padding N] "
          "[--origin top-left|bottom-left]\n";

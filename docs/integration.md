@@ -41,6 +41,15 @@ std::string exact_id = extracted.value().metadata.exact_id.hex();
 
 The parser layer stays outside the library. `libatlas` only needs the atlas bitmap and the UV rectangle.
 
+If you are processing many repeated crops, use the cached variant:
+
+```cpp
+libatlas::ExtractionIdentityCache cache;
+auto extracted = libatlas::extract_texture_cached(atlas_image, uv, options, &cache);
+```
+
+That performs a raw-crop ID pass first and only trims when the raw crop is new under the same trim policy.
+
 ## Mapping From Parser Data
 
 Typical parser-owned data:
@@ -59,21 +68,36 @@ Typical `libatlas` inputs:
 
 Typical `libatlas` outputs your parser-side tool may store:
 
+- cropped exact ID
 - exact ID
 - similarity signature
 - crop and trim rectangles
+- cache outcome
 - warnings
 - packed atlas placements and regenerated UVs
+
+If you want the library to handle exact-ID grouping and geometry remapping directly, use the workflow helpers in `libatlas/workflow.hpp`:
+
+- `TextureOccurrence`
+- `deduplicate_extractions_by_exact_id(...)`
+- `deduplicate_and_pack_occurrences(...)`
+
+That yields:
+
+- one logical texture per exact ID
+- one packed placement per logical texture
+- one final mapping from each original occurrence ID back to packed atlas and UVs
 
 ## Dedup Across Multiple Atlases
 
 For atlas comparison or merge workflows:
 
 1. Extract all relevant atlas entries
-2. Group by `metadata.exact_id`
-3. Treat those groups as strict duplicate candidates
-4. Compare `metadata.similarity_signature` for non-exact candidates
-5. Decide which image to keep or replace
+2. Optionally use `metadata.cropped_exact_id` as a raw-crop fast path
+3. Group by `metadata.exact_id`
+4. Treat those groups as strict duplicate candidates
+5. Compare `metadata.similarity_signature` for non-exact candidates
+6. Decide which image to keep or replace
 
 That works even when:
 
@@ -92,6 +116,34 @@ If you want to replace low-resolution art:
 5. Pack and update downstream UV references
 
 `libatlas` does not need to know whether the replacement came from manual art, an upscale pass, or a remastered build.
+
+## Direct Geometry Remap Workflow
+
+If your tool already has stable geometry identifiers, the high-level path is:
+
+1. Extract each geometry reference into an `ExtractedTexture`
+2. Wrap each result as `TextureOccurrence { geometry_id, extracted_texture }`
+3. Call `deduplicate_and_pack_occurrences(...)`
+4. Write back:
+   - `occurrence_id`
+   - `atlas_identifier`
+   - `uv_rect`
+
+That is the "shared texture edited once, all matching geometry updated" workflow for APT/FLAPT-style content.
+
+## Persistent Asset Store
+
+If you want a long-lived deduplicated image database, keep that in your tool layer rather than the core library.
+
+The intended pattern is:
+
+1. Use `libatlas` to extract and identify textures
+2. Store unique raw crops by `cropped_exact_id`
+3. Store unique canonical textures by `exact_id`
+4. Store occurrence records that map source geometry back to those IDs
+5. Preload those stored IDs into `ExtractionIdentityCache` on later runs
+
+`libatlas_tool extract --asset-store <dir>` implements exactly that pattern for PNG-based debugging and validation workflows.
 
 ## Migration From Parser-Coupled Tools
 

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <iomanip>
@@ -155,6 +156,19 @@ void append_u32_le(std::vector<uint8_t>& bytes, uint32_t value) {
   bytes.push_back(static_cast<uint8_t>((value >> 24U) & 0xffU));
 }
 
+int hex_nibble(char character) {
+  if (character >= '0' && character <= '9') {
+    return character - '0';
+  }
+  if (character >= 'a' && character <= 'f') {
+    return 10 + (character - 'a');
+  }
+  if (character >= 'A' && character <= 'F') {
+    return 10 + (character - 'A');
+  }
+  return -1;
+}
+
 }  // namespace
 
 bool CanonicalTextureId::empty() const noexcept {
@@ -233,6 +247,32 @@ Result<CanonicalTextureId> compute_canonical_texture_id(const Image& image,
 
   CanonicalTextureId id;
   id.bytes = sha256.finalize();
+  return Result<CanonicalTextureId>::success(std::move(id));
+}
+
+Result<CanonicalTextureId> parse_canonical_texture_id(const std::string& text) {
+  constexpr char kPrefix[] = "sha256:v1:";
+  std::string hex = text;
+  if (text.rfind(kPrefix, 0) == 0) {
+    hex = text.substr(std::strlen(kPrefix));
+  }
+
+  if (hex.size() != CanonicalTextureId::kDigestSize * 2U) {
+    return Result<CanonicalTextureId>::failure(
+        ErrorCode::ParseError,
+        "canonical texture IDs must be 64 hex characters or sha256:v1:<64 hex characters>");
+  }
+
+  CanonicalTextureId id;
+  for (std::size_t index = 0; index < CanonicalTextureId::kDigestSize; ++index) {
+    const int high = hex_nibble(hex[index * 2U]);
+    const int low = hex_nibble(hex[index * 2U + 1U]);
+    if (high < 0 || low < 0) {
+      return Result<CanonicalTextureId>::failure(ErrorCode::ParseError,
+                                                 "canonical texture ID contains non-hex characters");
+    }
+    id.bytes[index] = static_cast<uint8_t>((high << 4U) | low);
+  }
   return Result<CanonicalTextureId>::success(std::move(id));
 }
 

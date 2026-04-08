@@ -37,5 +37,6 @@ Result<CanonicalizedImage> canonicalize_image(const Image& image,
 Result<CanonicalTextureId> compute_canonical_texture_id(
     const Image& image,
     const CanonicalizationOptions& options = {});
+Result<CanonicalTextureId> parse_canonical_texture_id(const std::string& text);
 
 }  // namespace libatlas

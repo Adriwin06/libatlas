@@ -50,6 +50,15 @@ def parse_args() -> argparse.Namespace:
         help="Build configuration used when auto-detecting libatlas_tool.",
     )
     parser.add_argument(
+        "--asset-store",
+        type=Path,
+        default=None,
+        help=(
+            "Optional persistent asset-store directory passed to libatlas_tool extract. "
+            "Unlike --work-dir, this directory is not deleted between runs."
+        ),
+    )
+    parser.add_argument(
         "--max-width",
         type=int,
         default=1024,
@@ -302,6 +311,7 @@ def main() -> int:
     input_dir = args.input_dir.resolve()
     work_dir = args.work_dir.resolve()
     tool_path = args.tool.resolve() if args.tool else detect_tool_path(repo_root, args.config)
+    asset_store_dir = args.asset_store.resolve() if args.asset_store else None
 
     if not input_dir.exists():
         raise FileNotFoundError(f"Input directory does not exist: {input_dir}")
@@ -409,6 +419,7 @@ def main() -> int:
                 "--rounding",
                 "nearest",
             ]
+            + (["--asset-store", str(asset_store_dir)] if asset_store_dir else [])
         )
 
         extract_metadata = json.loads(extract_metadata_path.read_text(encoding="utf-8"))
@@ -517,6 +528,7 @@ def main() -> int:
         "tool": str(tool_path),
         "input_dir": str(input_dir),
         "work_dir": str(work_dir),
+        "asset_store_dir": str(asset_store_dir) if asset_store_dir else None,
         "source_count": len(summary_items),
         "extraction_count": total_extractions,
         "pack_item_count": len(pack_items),

@@ -12,6 +12,7 @@ into:
 
 - a cropped image
 - an optionally trimmed image
+- a raw crop exact ID
 - deterministic identity data
 - near-duplicate signature data
 - metadata that records how the result was produced
@@ -106,12 +107,33 @@ Why both images are kept:
 
 If trimming removes everything, the trimmed image becomes `0 x 0`. That is deliberate and visible.
 
+## Two-Pass Identity
+
+`libatlas` now records two deterministic IDs:
+
+- `cropped_exact_id`
+  - hash of the raw extracted crop before transparent-border trimming
+- `exact_id`
+  - hash of the resolved image after the configured trim policy
+
+This supports a two-pass extraction cache:
+
+1. Crop the atlas and compute `cropped_exact_id`
+2. If that raw crop ID is already known for the same trim policy, reuse the cached resolved image and logical ID immediately
+3. Otherwise trim, compute `exact_id`, and compare again
+
+This is an optimization, not a semantic change:
+
+- `exact_id` remains the logical texture identity
+- `cropped_exact_id` is a fast-path cache key
+
 ## Metadata Model
 
 `ExtractionMetadata` stores:
 
 - source atlas identifier
 - source atlas dimensions
+- applied trim policy and alpha threshold
 - original requested UV rectangle
 - resolved pixel rectangle before clamp
 - clamped crop rectangle
@@ -119,7 +141,9 @@ If trimming removes everything, the trimmed image becomes `0 x 0`. That is delib
 - trimmed rectangle relative to the crop
 - cropped and trimmed sizes
 - alpha coverage ratios
+- cropped exact ID
 - exact ID
+- cache outcome
 - similarity signature
 - warnings
 
@@ -133,6 +157,13 @@ After extraction:
 - similarity is computed from lightweight signatures
 
 By default the canonical content used for identity is the trimmed result, not the untrimmed crop. This means transparent border drift does not create different logical IDs.
+
+If you use `extract_texture_cached(...)`, metadata also records how the two-pass cache resolved the request:
+
+- `not_applied`
+- `cropped_exact_hit`
+- `exact_id_hit`
+- `new_entry`
 
 Near-duplicate matching is intentionally advisory:
 
@@ -164,5 +195,9 @@ One-pixel UV drift:
 Use `cropped_image` when you need to inspect the exact atlas extraction.
 
 Use `trimmed_image` and `metadata.exact_id` when you want stable identity and cleaner deduplication.
+
+Use `metadata.cropped_exact_id` when you want a fast first-pass cache key for repeated raw crops.
+
+Use `extract_texture_cached(...)` with `ExtractionIdentityCache` when you are processing many occurrences and want to avoid repeating the trim step for identical raw crops.
 
 Keep the warnings. In messy atlas datasets they are useful diagnostics, not noise.

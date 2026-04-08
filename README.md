@@ -9,10 +9,12 @@ It is designed for APT/FLAPT-adjacent workflows such as Burnout Paradise HUD and
 - Extracts sub-textures from atlases using plain UV rectangles
 - Resolves UVs with explicit origin, rounding, and clamping policies
 - Preserves rich extraction metadata for auditability and reconstruction
+- Computes both raw-crop and trimmed deterministic IDs
 - Computes deterministic exact texture IDs from canonicalized pixel content
 - Computes lightweight near-duplicate signatures for candidate matching
 - Rebuilds one or more deterministic output atlases with regenerated UVs
 - Supports replacing extracted content with higher-resolution images before packing
+- Provides cached extraction and a persistent asset-store option in the CLI
 - Provides PNG convenience I/O and a small JSON-driven CLI for testing pipelines
 
 ## Design Constraints
@@ -58,6 +60,7 @@ Main headers:
 - `libatlas/similarity.hpp`
 - `libatlas/packing.hpp`
 - `libatlas/image_io.hpp`
+- `libatlas/workflow.hpp`
 - `libatlas/libatlas.hpp`
 
 Typical flow:
@@ -92,6 +95,41 @@ std::vector<libatlas::PackItem> items{
 auto packed = libatlas::pack_atlases(items, pack_options);
 ```
 
+High-level dedup/remap flow:
+
+```cpp
+std::vector<libatlas::TextureOccurrence> occurrences{
+  {"geometry_001", extracted_a.value()},
+  {"geometry_044", extracted_b.value()}
+};
+
+auto workflow = libatlas::deduplicate_and_pack_occurrences(occurrences, pack_options);
+if (!workflow) {
+  throw std::runtime_error(workflow.error().message);
+}
+
+// Each original geometry occurrence now points at the packed placement.
+for (const auto& mapping : workflow.value().remapped.occurrence_mappings) {
+  // mapping.occurrence_id -> mapping.atlas_identifier + mapping.uv_rect
+}
+```
+
+Two-pass cached extraction flow:
+
+```cpp
+libatlas::ExtractionIdentityCache cache;
+
+auto extracted = libatlas::extract_texture_cached(atlas, uv, extraction, &cache);
+if (!extracted) {
+  throw std::runtime_error(extracted.error().message);
+}
+
+// metadata.cropped_exact_id is the raw crop hash.
+// metadata.exact_id is the trimmed logical texture ID.
+// metadata.cache_outcome tells you whether this was a raw-crop hit,
+// an exact-id hit after trimming, or a new cache entry.
+```
+
 ## CLI
 
 `libatlas_tool` is a small debugging and validation utility. It is not where the real logic lives. It calls the same public API another tool would call.
@@ -103,7 +141,8 @@ libatlas_tool extract \
   --atlas atlas.png \
   --requests requests.json \
   --output-dir out/extracted \
-  --metadata out/extracted.json
+  --metadata out/extracted.json \
+  --asset-store asset_store
 ```
 
 Request JSON:
@@ -125,7 +164,23 @@ Request JSON:
 }
 ```
 
-The tool writes cropped and trimmed PNGs plus metadata JSON containing UVs, pixel rectangles, exact IDs, similarity signatures, and warnings.
+The tool writes cropped and trimmed PNGs plus metadata JSON containing:
+
+- `cropped_exact_id`
+- `exact_id`
+- `cache_outcome`
+- UVs and pixel rectangles
+- similarity signatures
+- warnings
+
+If `--asset-store` is provided, the tool also maintains a persistent content-addressed store of:
+
+- source atlases
+- unique raw crops keyed by `cropped_exact_id`
+- unique canonical images keyed by `exact_id`
+- occurrence metadata that maps each request back to those IDs
+
+Running `extract` again with the same store preloads the two-pass cache and can skip trimming when a raw crop already exists.
 
 ### Pack
 
@@ -164,6 +219,12 @@ python tools/run_fixture_pipeline.py --config Debug
 
 By default the script writes converted PNGs, per-image extraction metadata, packed atlas PNGs, and a summary JSON under `build/fixture_pipeline/`.
 
+To use a persistent store across fixture runs:
+
+```bash
+python tools/run_fixture_pipeline.py --config Debug --asset-store C:/path/to/libatlas_store
+```
+
 ## Dependencies
 
 Core library:
@@ -178,8 +239,10 @@ Vendored convenience dependencies:
 ## Important Behavior
 
 - Exact IDs are derived from canonical pixel content only
+- Raw crop IDs are also available and are derived from the unclipped extracted crop before transparent-border trimming
 - Atlas names and source coordinates are informational metadata only
 - Trimming fully transparent borders can make two crops with different transparent padding share the same exact ID
+- Two-pass cached extraction first checks the raw crop ID, then falls back to the trimmed exact ID
 - Near-duplicate matching is advisory, not identity
 - Fully transparent trimmed results canonicalize to `0 x 0`
 - The packer is deterministic and shelf-based, not globally optimal
@@ -191,6 +254,7 @@ Vendored convenience dependencies:
 - [Extraction Pipeline](docs/extraction_pipeline.md)
 - [Repacking](docs/repacking.md)
 - [Integration Guide](docs/integration.md)
+- [Asset Store](docs/asset_store.md)
 
 ## License
 

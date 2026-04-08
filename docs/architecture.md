@@ -62,12 +62,14 @@ Public headers:
 
 - `include/libatlas/extraction.hpp`
   - `ExtractionOptions`
-  - `AtlasSourceInfo`
   - `ExtractionWarning`
+  - `IdentityCacheOutcome`
   - `ExtractionMetadata`
+  - `ExtractionIdentityCache`
   - `ExtractedTexture`
   - `resolve_uv_rect`
   - `extract_texture`
+  - `extract_texture_cached`
 
 - `include/libatlas/identity.hpp`
   - `CanonicalizationOptions`
@@ -88,6 +90,16 @@ Public headers:
   - `PackedAtlas`
   - `AtlasPackResult`
   - `pack_atlases`
+
+- `include/libatlas/workflow.hpp`
+  - `TextureOccurrence`
+  - `LogicalTexture`
+  - `DeduplicationResult`
+  - `PackedOccurrenceMapping`
+  - `deduplicate_extractions_by_exact_id`
+  - `build_pack_items_from_deduplication`
+  - `remap_deduplicated_occurrences`
+  - `deduplicate_and_pack_occurrences`
 
 ## Core Data Structures
 
@@ -138,6 +150,7 @@ Tracks the relationship between source data and extracted images:
 
 - optional `source_atlas_identifier` for traceability only
 - source atlas width and height
+- applied trim policy and alpha threshold
 - original requested UV rectangle
 - resolved pixel rectangle before clamping
 - clamped crop rectangle
@@ -145,8 +158,10 @@ Tracks the relationship between source data and extracted images:
 - trimmed rectangle relative to the crop
 - crop size and trimmed size
 - alpha coverage statistics
+- raw crop exact ID
 - exact ID
 - similarity signature
+- cache outcome
 - warnings
 
 ### `ExtractedTexture`
@@ -171,11 +186,12 @@ The extraction pipeline is policy-driven and deterministic:
 4. Apply the selected rounding policy
 5. Clamp to atlas bounds
 6. Crop the atlas image
-7. Optionally trim fully transparent borders using a configurable alpha threshold
-8. Normalize the image to canonical `RGBA8`
-9. Compute deterministic exact ID from canonical bytes
-10. Compute near-duplicate signature
-11. Return images, metadata, and warnings
+7. Compute a deterministic raw crop ID from the unclipped crop
+8. Optionally consult an extraction cache using that raw crop ID plus trim policy
+9. If needed, trim fully transparent borders using a configurable alpha threshold
+10. Compute deterministic exact ID from the resolved image
+11. Compute near-duplicate signature
+12. Return images, metadata, and warnings
 
 Important policies:
 
@@ -234,6 +250,25 @@ Why SHA-256:
 - easy to serialize as a hex string
 
 The library will expose the raw 32-byte digest plus a hex formatter.
+
+## Two-Pass Identity Strategy
+
+The library now uses two related deterministic IDs:
+
+- `cropped_exact_id`
+  - computed from the raw extracted crop before transparent-border trimming
+  - useful as a fast cache key
+- `exact_id`
+  - computed from the resolved image after the configured trim policy
+  - this remains the logical texture identity
+
+This supports an efficient two-pass workflow:
+
+1. Compare raw crop IDs first
+2. If the raw crop was already seen under the same trim policy, reuse the cached resolved image and logical ID immediately
+3. Otherwise trim once, compute the logical exact ID, and compare again
+
+This means byte-identical raw crops skip trimming on repeat occurrences, while crops that differ only by transparent padding still converge on the same logical `exact_id`.
 
 ## Near-Duplicate Strategy
 
@@ -310,6 +345,17 @@ Convenience dependencies vendored into the repository:
   - used by the CLI and tests that emit or parse JSON fixtures
 
 The core library remains usable without JSON or APT-related code.
+
+## Persistent Asset Store
+
+Persistent storage is intentionally implemented in the tool layer, not the core library.
+
+The CLI can maintain a content-addressed asset store keyed by:
+
+- raw crop ID for exact raw crops
+- logical exact ID for canonical textures
+
+That store can be reused across runs to preload the extraction cache. This keeps the core library stateless while still enabling long-lived deduplicated asset databases in real tools.
 
 ## Error Handling Strategy
 

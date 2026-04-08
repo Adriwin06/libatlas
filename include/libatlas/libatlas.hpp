@@ -7,3 +7,4 @@
 #include "libatlas/packing.hpp"
 #include "libatlas/result.hpp"
 #include "libatlas/similarity.hpp"
+#include "libatlas/workflow.hpp"

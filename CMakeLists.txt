@@ -17,6 +17,7 @@ add_library(libatlas
   src/image_io.cpp
   src/packing.cpp
   src/similarity.cpp
+  src/workflow.cpp
   third_party/lodepng/lodepng.cpp
 )
 
