@@ -52,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--asset-store",
         type=Path,
-        default=None,
+        default=repo_root / "build" / "fixture_asset_store",
         help=(
             "Optional persistent asset-store directory passed to libatlas_tool extract. "
             "Unlike --work-dir, this directory is not deleted between runs."
