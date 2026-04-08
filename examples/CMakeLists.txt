@@ -1,0 +1,4 @@
+add_executable(libatlas_example basic_pipeline.cpp)
+
+target_compile_features(libatlas_example PRIVATE cxx_std_17)
+target_link_libraries(libatlas_example PRIVATE libatlas)
