@@ -1,8 +1,11 @@
 #include "asset_store.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <fstream>
 #include <stdexcept>
+#include <thread>
 #include <system_error>
 
 #include "picojson.h"
@@ -34,12 +37,92 @@ std::string path_to_json_string(const fs::path& path) {
   return path.empty() ? std::string() : path.generic_string();
 }
 
+bool path_exists(const fs::path& path) {
+  std::error_code error;
+  return fs::exists(path, error);
+}
+
+void remove_file_if_present(const fs::path& path) noexcept {
+  std::error_code error;
+  fs::remove(path, error);
+}
+
+fs::path make_temp_path(const fs::path& path) {
+  static std::atomic<uint64_t> counter{0};
+  const auto stamp = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+  const auto ordinal = counter.fetch_add(1, std::memory_order_relaxed);
+  return fs::path(path.string() + ".tmp-" + std::to_string(stamp) + "-" + std::to_string(ordinal));
+}
+
 void write_text_file(const fs::path& path, const std::string& text) {
   std::ofstream output(path, std::ios::binary);
   if (!output) {
     throw std::runtime_error("failed to write file: " + path.string());
   }
   output << text;
+}
+
+void promote_temp_file(const fs::path& temp_path, const fs::path& final_path) {
+  std::error_code last_error;
+  for (int attempt = 1; attempt <= 8; ++attempt) {
+    std::error_code error;
+    fs::rename(temp_path, final_path, error);
+    if (!error) {
+      return;
+    }
+    if (path_exists(final_path)) {
+      remove_file_if_present(temp_path);
+      return;
+    }
+
+    last_error = error;
+    if (attempt < 8) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(25 * attempt));
+    }
+  }
+
+  remove_file_if_present(temp_path);
+  if (path_exists(final_path)) {
+    return;
+  }
+
+  throw std::system_error(last_error,
+                          "failed to move temporary file into place for " + final_path.string());
+}
+
+// The fixture pipeline can run multiple extract workers against one shared asset store.
+// Write content-addressed files through temp paths so readers never observe partial JSON or PNG bytes.
+void write_text_file_if_absent(const fs::path& path, const std::string& text) {
+  if (path_exists(path)) {
+    return;
+  }
+
+  const fs::path temp_path = make_temp_path(path);
+  try {
+    write_text_file(temp_path, text);
+    promote_temp_file(temp_path, path);
+  } catch (...) {
+    remove_file_if_present(temp_path);
+    throw;
+  }
+}
+
+void save_png_if_absent(const fs::path& path, const libatlas::Image& image) {
+  if (path.empty() || path_exists(path)) {
+    return;
+  }
+
+  const fs::path temp_path = make_temp_path(path);
+  try {
+    auto saved = libatlas::save_png(image, temp_path.string());
+    if (!saved) {
+      throw std::runtime_error(saved.error().message);
+    }
+    promote_temp_file(temp_path, path);
+  } catch (...) {
+    remove_file_if_present(temp_path);
+    throw;
+  }
 }
 
 std::string read_text_file(const fs::path& path) {
@@ -294,17 +377,14 @@ libatlas::Result<StoredAssetPaths> AssetStore::record_occurrence(const std::stri
         (sanitize_name(atlas_identifier) + "__" + sanitize_name(occurrence_name) + "__" +
          cropped_stem.substr(0, std::min<std::size_t>(cropped_stem.size(), 24U)) + ".json");
 
-    stored.atlas_existed = fs::exists(stored.atlas_image_path);
+    stored.atlas_existed = path_exists(stored.atlas_image_path);
     stored.cropped_existed =
-        stored.cropped_image_path.empty() ? false : fs::exists(stored.cropped_image_path);
+        stored.cropped_image_path.empty() ? false : path_exists(stored.cropped_image_path);
     stored.canonical_existed =
-        stored.canonical_image_path.empty() ? false : fs::exists(stored.canonical_image_path);
+        stored.canonical_image_path.empty() ? false : path_exists(stored.canonical_image_path);
 
     if (!stored.atlas_existed) {
-      auto saved = libatlas::save_png(atlas_image, stored.atlas_image_path.string());
-      if (!saved) {
-        return libatlas::Result<StoredAssetPaths>::failure(saved.error().code, saved.error().message);
-      }
+      save_png_if_absent(stored.atlas_image_path, atlas_image);
 
       picojson::object atlas_object;
       atlas_object["atlas_id"] = picojson::value(atlas_id.value().to_string());
@@ -314,24 +394,19 @@ libatlas::Result<StoredAssetPaths> AssetStore::record_occurrence(const std::stri
           picojson::value(path_to_json_string(make_relative_path(root_, stored.atlas_image_path)));
       atlas_object["width"] = picojson::value(static_cast<double>(atlas_image.width));
       atlas_object["height"] = picojson::value(static_cast<double>(atlas_image.height));
-      write_text_file(stored.atlas_metadata_path, picojson::value(atlas_object).serialize(true));
+      write_text_file_if_absent(stored.atlas_metadata_path,
+                                picojson::value(atlas_object).serialize(true));
     }
 
     if (!stored.cropped_image_path.empty() && !stored.cropped_existed) {
-      auto saved = libatlas::save_png(extracted.cropped_image, stored.cropped_image_path.string());
-      if (!saved) {
-        return libatlas::Result<StoredAssetPaths>::failure(saved.error().code, saved.error().message);
-      }
+      save_png_if_absent(stored.cropped_image_path, extracted.cropped_image);
     }
 
     if (!stored.canonical_image_path.empty() && !stored.canonical_existed) {
-      auto saved = libatlas::save_png(extracted.trimmed_image, stored.canonical_image_path.string());
-      if (!saved) {
-        return libatlas::Result<StoredAssetPaths>::failure(saved.error().code, saved.error().message);
-      }
+      save_png_if_absent(stored.canonical_image_path, extracted.trimmed_image);
     }
 
-    if (!fs::exists(stored.cropped_metadata_path)) {
+    if (!path_exists(stored.cropped_metadata_path)) {
       picojson::object cropped_object;
       cropped_object["cropped_exact_id"] = picojson::value(extracted.metadata.cropped_exact_id.to_string());
       cropped_object["exact_id"] = picojson::value(extracted.metadata.exact_id.to_string());
@@ -351,10 +426,11 @@ libatlas::Result<StoredAssetPaths> AssetStore::record_occurrence(const std::stri
       if (extracted.metadata.has_similarity_signature) {
         cropped_object["similarity_signature"] = to_json_similarity(extracted.metadata.similarity_signature);
       }
-      write_text_file(stored.cropped_metadata_path, picojson::value(cropped_object).serialize(true));
+      write_text_file_if_absent(stored.cropped_metadata_path,
+                                picojson::value(cropped_object).serialize(true));
     }
 
-    if (!fs::exists(stored.canonical_metadata_path)) {
+    if (!path_exists(stored.canonical_metadata_path)) {
       picojson::object canonical_object;
       canonical_object["exact_id"] = picojson::value(extracted.metadata.exact_id.to_string());
       canonical_object["canonical_image"] =
@@ -368,7 +444,8 @@ libatlas::Result<StoredAssetPaths> AssetStore::record_occurrence(const std::stri
       if (extracted.metadata.has_similarity_signature) {
         canonical_object["similarity_signature"] = to_json_similarity(extracted.metadata.similarity_signature);
       }
-      write_text_file(stored.canonical_metadata_path, picojson::value(canonical_object).serialize(true));
+      write_text_file_if_absent(stored.canonical_metadata_path,
+                                picojson::value(canonical_object).serialize(true));
     }
 
     picojson::object occurrence_object;

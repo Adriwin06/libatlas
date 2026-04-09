@@ -44,3 +44,9 @@
 /build/
 /out/
 /.vs/
+
+# Python cache
+*/__pycache__/
+
+# Test images
+tests/images_files/
