@@ -208,6 +208,19 @@ Pack manifest JSON:
 }
 ```
 
+### Similarity Report
+
+```bash
+libatlas_tool similarity-report \
+  --metadata-dir out/extract_metadata \
+  --output out/similarity_report.json \
+  --review-min-score 0.90 \
+  --auto-min-score 0.92
+```
+
+This command reads extraction metadata JSON files, groups strict matches by `exact_id`, and emits
+a report of non-exact candidate pairs using the library's similarity classification rules.
+
 ### Fixture Smoke Run
 
 The repository also includes `tests/images_files` DDS/TGA fixtures. The core library still does not decode those formats directly, but `tools/run_fixture_pipeline.py` can convert them with Pillow, derive normalized top-left UVs, run `libatlas_tool extract`, and repack the trimmed outputs. By default it extracts one item per qualifying disconnected alpha component, which is useful for fully de-atlasing sprite sheets. If you want the older behavior, `--split-mode auto` only splits simple multi-sprite sheets and `--split-mode bbox` forces one visible-bounds crop per source image.
@@ -218,6 +231,10 @@ python tools/run_fixture_pipeline.py --config Debug
 ```
 
 By default the script writes converted PNGs, per-image extraction metadata, packed atlas PNGs, and a summary JSON under `build/fixture_pipeline/`.
+
+It also maintains a persistent logical image store under `build/fixture_logical_store/` by default.
+That folder contains one editable PNG per logical texture group. When the pipeline packs outputs,
+all occurrences mapped to the same logical group reuse that one image.
 
 To use a persistent store across fixture runs:
 

@@ -34,6 +34,30 @@ struct SimilarityComparison {
   bool likely_related = false;
 };
 
+enum class SimilarityCandidateKind {
+  None,
+  ReviewCandidate,
+  AutoDuplicateCandidate
+};
+
+const char* similarity_candidate_kind_to_string(SimilarityCandidateKind kind) noexcept;
+
+struct SimilarityClassificationOptions {
+  SimilarityOptions similarity_options;
+  double review_min_score = 0.90;
+  double auto_min_score = 0.92;
+  int auto_max_luminance_distance = 8;
+  int auto_max_alpha_distance = 8;
+  double auto_max_aspect_ratio_delta = 0.10;
+  double auto_min_dimension_ratio = 0.90;
+};
+
+struct SimilarityClassification {
+  SimilarityComparison comparison;
+  double alpha_coverage_delta = 0.0;
+  SimilarityCandidateKind candidate_kind = SimilarityCandidateKind::None;
+};
+
 Result<SimilaritySignature> compute_similarity_signature(
     const Image& image,
     const SimilarityOptions& options = {});
@@ -42,5 +66,10 @@ SimilarityComparison compare_similarity(
     const SimilaritySignature& lhs,
     const SimilaritySignature& rhs,
     const SimilarityOptions& options = {});
+
+SimilarityClassification classify_similarity(
+    const SimilaritySignature& lhs,
+    const SimilaritySignature& rhs,
+    const SimilarityClassificationOptions& options = {});
 
 }  // namespace libatlas

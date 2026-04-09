@@ -19,6 +19,8 @@ using libatlas::Image;
 using libatlas::PackItem;
 using libatlas::PixelRect;
 using libatlas::RgbaPixel;
+using libatlas::SimilarityCandidateKind;
+using libatlas::SimilarityClassificationOptions;
 using libatlas::SimilarityOptions;
 using libatlas::TextureOccurrence;
 using libatlas::UvOrigin;
@@ -267,6 +269,70 @@ LIBATLAS_TEST(similarity_detects_likely_related_non_exact_variants) {
                              std::to_string(comparison.aspect_ratio_delta) +
                              ", score=" + std::to_string(comparison.score));
   }
+}
+
+LIBATLAS_TEST(classify_similarity_returns_auto_duplicate_for_strong_match) {
+  libatlas::SimilaritySignature lhs;
+  lhs.canonical_width = 10;
+  lhs.canonical_height = 10;
+  lhs.alpha_coverage = 0.50;
+  lhs.luminance_hash = 0xf0f0f0f0f0f0f0f0ULL;
+  lhs.alpha_hash = 0xaaaaaaaaaaaaaaaaULL;
+
+  libatlas::SimilaritySignature rhs = lhs;
+  rhs.alpha_coverage = 0.55;
+
+  SimilarityClassificationOptions options;
+  const auto classification = libatlas::classify_similarity(lhs, rhs, options);
+
+  EXPECT_EQ(classification.candidate_kind, SimilarityCandidateKind::AutoDuplicateCandidate);
+  EXPECT_TRUE(classification.comparison.likely_related);
+  EXPECT_TRUE(nearly_equal(classification.comparison.score, 1.0));
+  EXPECT_TRUE(nearly_equal(classification.alpha_coverage_delta, 0.05));
+}
+
+LIBATLAS_TEST(classify_similarity_returns_review_candidate_when_auto_thresholds_fail) {
+  libatlas::SimilaritySignature lhs;
+  lhs.canonical_width = 10;
+  lhs.canonical_height = 10;
+  lhs.alpha_coverage = 0.50;
+  lhs.luminance_hash = 0xf0f0f0f0f0f0f0f0ULL;
+  lhs.alpha_hash = 0xaaaaaaaaaaaaaaaaULL;
+
+  libatlas::SimilaritySignature rhs = lhs;
+  rhs.canonical_width = 10;
+  rhs.canonical_height = 8;
+  rhs.alpha_coverage = 0.52;
+
+  SimilarityClassificationOptions options;
+  const auto classification = libatlas::classify_similarity(lhs, rhs, options);
+
+  EXPECT_EQ(classification.candidate_kind, SimilarityCandidateKind::ReviewCandidate);
+  EXPECT_TRUE(classification.comparison.likely_related);
+  EXPECT_TRUE(classification.comparison.score >= options.review_min_score);
+  EXPECT_TRUE(classification.comparison.dimension_ratio < options.auto_min_dimension_ratio);
+}
+
+LIBATLAS_TEST(classify_similarity_returns_none_for_unrelated_signatures) {
+  libatlas::SimilaritySignature lhs;
+  lhs.canonical_width = 16;
+  lhs.canonical_height = 16;
+  lhs.alpha_coverage = 0.90;
+  lhs.luminance_hash = 0xffffffffffffffffULL;
+  lhs.alpha_hash = 0xffffffffffffffffULL;
+
+  libatlas::SimilaritySignature rhs;
+  rhs.canonical_width = 16;
+  rhs.canonical_height = 16;
+  rhs.alpha_coverage = 0.10;
+  rhs.luminance_hash = 0x0000000000000000ULL;
+  rhs.alpha_hash = 0x0000000000000000ULL;
+
+  SimilarityClassificationOptions options;
+  const auto classification = libatlas::classify_similarity(lhs, rhs, options);
+
+  EXPECT_EQ(classification.candidate_kind, SimilarityCandidateKind::None);
+  EXPECT_FALSE(classification.comparison.likely_related);
 }
 
 LIBATLAS_TEST(pack_atlases_is_deterministic_and_regenerates_uvs) {

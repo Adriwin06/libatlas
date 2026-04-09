@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -38,6 +39,67 @@ struct PackCommand {
   uint32_t max_height = 1024;
   uint32_t padding = 1;
   libatlas::UvOrigin origin = libatlas::UvOrigin::TopLeft;
+};
+
+struct SimilarityReportCommand {
+  fs::path metadata_dir;
+  fs::path output_path;
+  fs::path source_map_path;
+  std::size_t max_pairs = 500;
+  libatlas::SimilarityClassificationOptions classification_options;
+};
+
+struct SimilarityReportGroup {
+  std::string exact_id;
+  std::size_t occurrence_count = 0;
+  std::vector<std::string> fixtures;
+  std::vector<std::string> source_atlas_identifiers;
+  std::vector<std::string> source_images;
+  std::string representative_name;
+  std::string representative_source_atlas_identifier;
+  std::string representative_source_image;
+  std::string representative_trimmed_image;
+  std::string representative_metadata_json;
+  libatlas::SimilaritySignature signature;
+};
+
+struct SimilarityPairRecord {
+  std::size_t left_index = 0;
+  std::size_t right_index = 0;
+  libatlas::SimilarityClassification classification;
+};
+
+struct DisjointSet {
+  std::vector<std::size_t> parent;
+  std::vector<std::size_t> rank;
+
+  explicit DisjointSet(std::size_t count) : parent(count), rank(count, 0) {
+    for (std::size_t index = 0; index < count; ++index) {
+      parent[index] = index;
+    }
+  }
+
+  std::size_t find(std::size_t value) {
+    if (parent[value] != value) {
+      parent[value] = find(parent[value]);
+    }
+    return parent[value];
+  }
+
+  void unite(std::size_t lhs, std::size_t rhs) {
+    lhs = find(lhs);
+    rhs = find(rhs);
+    if (lhs == rhs) {
+      return;
+    }
+    if (rank[lhs] < rank[rhs]) {
+      std::swap(lhs, rhs);
+    }
+    parent[rhs] = lhs;
+    if (rank[lhs] == rank[rhs]) {
+      ++rank[lhs];
+    }
+  }
 };
 
 std::string read_text_file(const fs::path& path) {
@@ -162,6 +224,28 @@ picojson::value to_json_similarity(const libatlas::SimilaritySignature& signatur
   return picojson::value(object);
 }
 
+libatlas::SimilaritySignature parse_similarity(const picojson::object& object,
+                                               const std::string& context) {
+  libatlas::SimilaritySignature signature;
+  signature.canonical_width = static_cast<uint32_t>(require_number(object, "canonical_width", context));
+  signature.canonical_height =
+      static_cast<uint32_t>(require_number(object, "canonical_height", context));
+  signature.alpha_coverage = require_number(object, "alpha_coverage", context);
+  signature.luminance_hash =
+      static_cast<uint64_t>(std::stoull(require_string(object, "luminance_hash", context)));
+  signature.alpha_hash =
+      static_cast<uint64_t>(std::stoull(require_string(object, "alpha_hash", context)));
+  return signature;
+}
+
+picojson::value to_json_string_array(const std::vector<std::string>& values) {
+  picojson::array array;
+  for (const auto& value : values) {
+    array.emplace_back(value);
+  }
+  return picojson::value(array);
+}
+
 picojson::value to_json_metadata(const libatlas::ExtractionMetadata& metadata) {
   picojson::object object;
   object["source_atlas_identifier"] = picojson::value(metadata.source_atlas_identifier);
@@ -237,6 +321,154 @@ libatlas::UvRoundingPolicy parse_rounding(const std::string& text) {
   throw std::runtime_error("invalid rounding policy: " + text);
 }
 
+std::vector<std::string> sorted_unique(std::vector<std::string> values) {
+  std::sort(values.begin(), values.end());
+  values.erase(std::unique(values.begin(), values.end()), values.end());
+  return values;
+}
+
+std::map<std::string, std::string> load_source_map(const fs::path& path) {
+  if (path.empty()) {
+    return {};
+  }
+
+  const picojson::object root = require_object(load_json_file(path), "similarity source map");
+  std::map<std::string, std::string> source_map;
+  for (const auto& entry : root) {
+    if (!entry.second.is<std::string>()) {
+      throw std::runtime_error("similarity source map values must be strings");
+    }
+    source_map.emplace(entry.first, entry.second.get<std::string>());
+  }
+  return source_map;
+}
+
+bool pair_rank_better(const SimilarityPairRecord& lhs,
+                      const SimilarityPairRecord& rhs,
+                      const std::vector<SimilarityReportGroup>& groups) {
+  if (lhs.classification.comparison.score != rhs.classification.comparison.score) {
+    return lhs.classification.comparison.score > rhs.classification.comparison.score;
+  }
+  if (lhs.classification.comparison.luminance_distance != rhs.classification.comparison.luminance_distance) {
+    return lhs.classification.comparison.luminance_distance <
+           rhs.classification.comparison.luminance_distance;
+  }
+  if (lhs.classification.comparison.alpha_distance != rhs.classification.comparison.alpha_distance) {
+    return lhs.classification.comparison.alpha_distance <
+           rhs.classification.comparison.alpha_distance;
+  }
+  if (groups[lhs.left_index].exact_id != groups[rhs.left_index].exact_id) {
+    return groups[lhs.left_index].exact_id < groups[rhs.left_index].exact_id;
+  }
+  return groups[lhs.right_index].exact_id < groups[rhs.right_index].exact_id;
+}
+
+void retain_top_pair(std::vector<SimilarityPairRecord>& retained,
+                     SimilarityPairRecord candidate,
+                     std::size_t limit,
+                     const std::vector<SimilarityReportGroup>& groups) {
+  if (limit == 0) {
+    return;
+  }
+  if (retained.size() < limit) {
+    retained.push_back(std::move(candidate));
+    return;
+  }
+
+  std::size_t worst_index = 0;
+  for (std::size_t index = 1; index < retained.size(); ++index) {
+    if (pair_rank_better(retained[worst_index], retained[index], groups)) {
+      worst_index = index;
+    }
+  }
+
+  if (pair_rank_better(candidate, retained[worst_index], groups)) {
+    retained[worst_index] = std::move(candidate);
+  }
+}
+
+picojson::value to_json_similarity_group(const SimilarityReportGroup& group) {
+  picojson::object object;
+  object["exact_id"] = picojson::value(group.exact_id);
+  object["occurrence_count"] = picojson::value(static_cast<double>(group.occurrence_count));
+  object["fixtures"] = to_json_string_array(group.fixtures);
+  object["source_atlas_identifiers"] = to_json_string_array(group.source_atlas_identifiers);
+  object["source_images"] = to_json_string_array(group.source_images);
+  object["representative_name"] = picojson::value(group.representative_name);
+  object["representative_source_atlas_identifier"] =
+      picojson::value(group.representative_source_atlas_identifier);
+  object["representative_source_image"] = picojson::value(group.representative_source_image);
+  object["representative_trimmed_image"] = picojson::value(group.representative_trimmed_image);
+  object["representative_metadata_json"] = picojson::value(group.representative_metadata_json);
+
+  picojson::object canonical_size;
+  canonical_size["width"] = picojson::value(static_cast<double>(group.signature.canonical_width));
+  canonical_size["height"] = picojson::value(static_cast<double>(group.signature.canonical_height));
+  object["canonical_size"] = picojson::value(canonical_size);
+  object["alpha_coverage"] = picojson::value(group.signature.alpha_coverage);
+  return picojson::value(object);
+}
+
+picojson::value to_json_similarity_pair(const SimilarityPairRecord& pair,
+                                        const std::vector<SimilarityReportGroup>& groups) {
+  picojson::object object;
+  object["classification"] =
+      picojson::value(libatlas::similarity_candidate_kind_to_string(pair.classification.candidate_kind));
+  object["score"] = picojson::value(pair.classification.comparison.score);
+  object["luminance_distance"] =
+      picojson::value(static_cast<double>(pair.classification.comparison.luminance_distance));
+  object["alpha_distance"] =
+      picojson::value(static_cast<double>(pair.classification.comparison.alpha_distance));
+  object["dimension_ratio"] = picojson::value(pair.classification.comparison.dimension_ratio);
+  object["aspect_ratio_delta"] = picojson::value(pair.classification.comparison.aspect_ratio_delta);
+  object["alpha_coverage_delta"] = picojson::value(pair.classification.alpha_coverage_delta);
+  object["left"] = to_json_similarity_group(groups[pair.left_index]);
+  object["right"] = to_json_similarity_group(groups[pair.right_index]);
+  return picojson::value(object);
+}
+
+picojson::value to_json_auto_component(const std::vector<std::size_t>& component,
+                                       const std::vector<SimilarityReportGroup>& groups) {
+  picojson::object object;
+  picojson::array exact_ids;
+  picojson::array fixtures;
+  picojson::array source_atlas_identifiers;
+  picojson::array source_images;
+  std::size_t occurrence_count = 0;
+
+  std::vector<std::string> all_fixtures;
+  std::vector<std::string> all_atlas_identifiers;
+  std::vector<std::string> all_source_images;
+  for (const auto group_index : component) {
+    const auto& group = groups[group_index];
+    exact_ids.emplace_back(group.exact_id);
+    occurrence_count += group.occurrence_count;
+    all_fixtures.insert(all_fixtures.end(), group.fixtures.begin(), group.fixtures.end());
+    all_atlas_identifiers.insert(all_atlas_identifiers.end(),
+                                 group.source_atlas_identifiers.begin(),
+                                 group.source_atlas_identifiers.end());
+    all_source_images.insert(all_source_images.end(), group.source_images.begin(), group.source_images.end());
+  }
+
+  for (const auto& value : sorted_unique(std::move(all_fixtures))) {
+    fixtures.emplace_back(value);
+  }
+  for (const auto& value : sorted_unique(std::move(all_atlas_identifiers))) {
+    source_atlas_identifiers.emplace_back(value);
+  }
+  for (const auto& value : sorted_unique(std::move(all_source_images))) {
+    source_images.emplace_back(value);
+  }
+
+  object["member_exact_ids"] = picojson::value(exact_ids);
+  object["member_exact_id_count"] = picojson::value(static_cast<double>(component.size()));
+  object["member_occurrence_count"] = picojson::value(static_cast<double>(occurrence_count));
+  object["fixtures"] = picojson::value(fixtures);
+  object["source_atlas_identifiers"] = picojson::value(source_atlas_identifiers);
+  object["source_images"] = picojson::value(source_images);
+  return picojson::value(object);
+}
+
 ExtractCommand parse_extract_command(int argc, char** argv) {
   ExtractCommand command;
   for (int index = 2; index < argc; ++index) {
@@ -298,6 +530,69 @@ PackCommand parse_pack_command(int argc, char** argv) {
 
   if (command.manifest_path.empty() || command.output_dir.empty() || command.metadata_path.empty()) {
     throw std::runtime_error("pack requires --manifest, --output-dir, and --metadata");
+  }
+  return command;
+}
+
+SimilarityReportCommand parse_similarity_report_command(int argc, char** argv) {
+  SimilarityReportCommand command;
+  for (int index = 2; index < argc; ++index) {
+    const std::string argument = argv[index];
+    if (argument == "--metadata-dir" && index + 1 < argc) {
+      command.metadata_dir = argv[++index];
+    } else if (argument == "--output" && index + 1 < argc) {
+      command.output_path = argv[++index];
+    } else if (argument == "--source-map" && index + 1 < argc) {
+      command.source_map_path = argv[++index];
+    } else if (argument == "--review-min-score" && index + 1 < argc) {
+      command.classification_options.review_min_score = std::stod(argv[++index]);
+    } else if (argument == "--auto-min-score" && index + 1 < argc) {
+      command.classification_options.auto_min_score = std::stod(argv[++index]);
+    } else if (argument == "--auto-max-luminance-distance" && index + 1 < argc) {
+      command.classification_options.auto_max_luminance_distance = std::stoi(argv[++index]);
+    } else if (argument == "--auto-max-alpha-distance" && index + 1 < argc) {
+      command.classification_options.auto_max_alpha_distance = std::stoi(argv[++index]);
+    } else if (argument == "--auto-max-aspect-ratio-delta" && index + 1 < argc) {
+      command.classification_options.auto_max_aspect_ratio_delta = std::stod(argv[++index]);
+    } else if (argument == "--auto-min-dimension-ratio" && index + 1 < argc) {
+      command.classification_options.auto_min_dimension_ratio = std::stod(argv[++index]);
+    } else if (argument == "--max-pairs" && index + 1 < argc) {
+      command.max_pairs = static_cast<std::size_t>(std::stoul(argv[++index]));
+    } else {
+      throw std::runtime_error("unknown similarity-report argument: " + argument);
+    }
+  }
+
+  if (command.metadata_dir.empty() || command.output_path.empty()) {
+    throw std::runtime_error("similarity-report requires --metadata-dir and --output");
+  }
+  if (command.classification_options.review_min_score < 0.0 ||
+      command.classification_options.review_min_score > 1.0) {
+    throw std::runtime_error("--review-min-score must be between 0 and 1");
+  }
+  if (command.classification_options.auto_min_score < 0.0 ||
+      command.classification_options.auto_min_score > 1.0) {
+    throw std::runtime_error("--auto-min-score must be between 0 and 1");
+  }
+  if (command.classification_options.auto_min_score <
+      command.classification_options.review_min_score) {
+    throw std::runtime_error("--auto-min-score must be at least --review-min-score");
+  }
+  if (command.classification_options.auto_max_luminance_distance < 0) {
+    throw std::runtime_error("--auto-max-luminance-distance must be at least 0");
+  }
+  if (command.classification_options.auto_max_alpha_distance < 0) {
+    throw std::runtime_error("--auto-max-alpha-distance must be at least 0");
+  }
+  if (command.classification_options.auto_max_aspect_ratio_delta < 0.0) {
+    throw std::runtime_error("--auto-max-aspect-ratio-delta must be at least 0");
+  }
+  if (command.classification_options.auto_min_dimension_ratio < 0.0 ||
+      command.classification_options.auto_min_dimension_ratio > 1.0) {
+    throw std::runtime_error("--auto-min-dimension-ratio must be between 0 and 1");
+  }
+  if (command.max_pairs < 1) {
+    throw std::runtime_error("--max-pairs must be at least 1");
   }
   return command;
 }
@@ -468,6 +763,218 @@ void run_pack(const PackCommand& command) {
   write_text_file(command.metadata_path, picojson::value(output_root).serialize(true));
 }
 
+void run_similarity_report(const SimilarityReportCommand& command) {
+  std::vector<fs::path> metadata_files;
+  for (const auto& entry : fs::directory_iterator(command.metadata_dir)) {
+    if (entry.is_regular_file() && entry.path().extension() == ".json") {
+      metadata_files.push_back(entry.path());
+    }
+  }
+  std::sort(metadata_files.begin(), metadata_files.end());
+
+  const auto source_map = load_source_map(command.source_map_path);
+  std::map<std::string, SimilarityReportGroup> groups_by_exact_id;
+
+  for (const auto& metadata_path : metadata_files) {
+    const picojson::object root =
+        require_object(load_json_file(metadata_path), "similarity report metadata root");
+    const std::string default_atlas_identifier = metadata_path.stem().string();
+    const std::string atlas_identifier = optional_string(root, "atlas_identifier").empty()
+                                             ? default_atlas_identifier
+                                             : optional_string(root, "atlas_identifier");
+    const picojson::array& items = require_array(
+        require_field(root, "items", "similarity report metadata root"),
+        "similarity report metadata root.items");
+
+    for (std::size_t index = 0; index < items.size(); ++index) {
+      const std::string context =
+          "similarity report metadata item[" + std::to_string(index) + "]";
+      const picojson::object& item = require_object(items[index], context);
+      const picojson::object& metadata =
+          require_object(require_field(item, "metadata", context), context + ".metadata");
+      const auto similarity_iterator = metadata.find("similarity_signature");
+      if (similarity_iterator == metadata.end()) {
+        continue;
+      }
+
+      const std::string exact_id = require_string(metadata, "exact_id", context + ".metadata");
+      const std::string item_name = require_string(item, "name", context);
+      const std::string source_atlas_identifier = optional_string(metadata, "source_atlas_identifier").empty()
+                                                      ? atlas_identifier
+                                                      : optional_string(metadata, "source_atlas_identifier");
+      const std::string trimmed_image = optional_string(item, "trimmed_image");
+      const auto source_iterator = source_map.find(source_atlas_identifier);
+      const std::string source_image =
+          source_iterator == source_map.end() ? std::string() : source_iterator->second;
+      const libatlas::SimilaritySignature signature = parse_similarity(
+          require_object(similarity_iterator->second, context + ".metadata.similarity_signature"),
+          context + ".metadata.similarity_signature");
+
+      auto [group_iterator, inserted] =
+          groups_by_exact_id.emplace(exact_id, SimilarityReportGroup{});
+      SimilarityReportGroup& group = group_iterator->second;
+      if (inserted) {
+        group.exact_id = exact_id;
+        group.representative_name = item_name;
+        group.representative_source_atlas_identifier = source_atlas_identifier;
+        group.representative_source_image = source_image;
+        group.representative_trimmed_image = trimmed_image;
+        group.representative_metadata_json = metadata_path.generic_string();
+        group.signature = signature;
+      }
+
+      ++group.occurrence_count;
+      group.fixtures.push_back(item_name);
+      group.source_atlas_identifiers.push_back(source_atlas_identifier);
+      if (!source_image.empty()) {
+        group.source_images.push_back(source_image);
+      }
+    }
+  }
+
+  std::vector<SimilarityReportGroup> groups;
+  groups.reserve(groups_by_exact_id.size());
+  for (auto& entry : groups_by_exact_id) {
+    entry.second.fixtures = sorted_unique(std::move(entry.second.fixtures));
+    entry.second.source_atlas_identifiers = sorted_unique(std::move(entry.second.source_atlas_identifiers));
+    entry.second.source_images = sorted_unique(std::move(entry.second.source_images));
+    groups.push_back(std::move(entry.second));
+  }
+
+  std::vector<SimilarityPairRecord> auto_pairs;
+  std::vector<SimilarityPairRecord> review_pairs;
+  std::size_t auto_pair_count = 0;
+  std::size_t review_pair_count = 0;
+  DisjointSet auto_components(groups.size());
+
+  for (std::size_t left_index = 0; left_index < groups.size(); ++left_index) {
+    for (std::size_t right_index = left_index + 1; right_index < groups.size(); ++right_index) {
+      libatlas::SimilarityClassification classification = libatlas::classify_similarity(
+          groups[left_index].signature,
+          groups[right_index].signature,
+          command.classification_options);
+      if (classification.candidate_kind == libatlas::SimilarityCandidateKind::None) {
+        continue;
+      }
+
+      SimilarityPairRecord pair;
+      pair.left_index = left_index;
+      pair.right_index = right_index;
+      pair.classification = classification;
+      if (classification.candidate_kind == libatlas::SimilarityCandidateKind::AutoDuplicateCandidate) {
+        auto_components.unite(left_index, right_index);
+        ++auto_pair_count;
+        retain_top_pair(auto_pairs, std::move(pair), command.max_pairs, groups);
+      } else {
+        ++review_pair_count;
+        retain_top_pair(review_pairs, std::move(pair), command.max_pairs, groups);
+      }
+    }
+  }
+
+  std::sort(auto_pairs.begin(),
+            auto_pairs.end(),
+            [&groups](const SimilarityPairRecord& lhs, const SimilarityPairRecord& rhs) {
+              return pair_rank_better(lhs, rhs, groups);
+            });
+  std::sort(review_pairs.begin(),
+            review_pairs.end(),
+            [&groups](const SimilarityPairRecord& lhs, const SimilarityPairRecord& rhs) {
+              return pair_rank_better(lhs, rhs, groups);
+            });
+
+  picojson::array auto_pairs_json;
+  for (const auto& pair : auto_pairs) {
+    auto_pairs_json.emplace_back(to_json_similarity_pair(pair, groups));
+  }
+  picojson::array review_pairs_json;
+  for (const auto& pair : review_pairs) {
+    review_pairs_json.emplace_back(to_json_similarity_pair(pair, groups));
+  }
+
+  std::map<std::size_t, std::vector<std::size_t>> component_indices;
+  for (std::size_t index = 0; index < groups.size(); ++index) {
+    component_indices[auto_components.find(index)].push_back(index);
+  }
+
+  std::vector<std::vector<std::size_t>> auto_duplicate_components;
+  for (auto& entry : component_indices) {
+    if (entry.second.size() <= 1) {
+      continue;
+    }
+    std::sort(
+        entry.second.begin(),
+        entry.second.end(),
+        [&groups](std::size_t lhs, std::size_t rhs) { return groups[lhs].exact_id < groups[rhs].exact_id; });
+    auto_duplicate_components.push_back(std::move(entry.second));
+  }
+  std::sort(auto_duplicate_components.begin(),
+            auto_duplicate_components.end(),
+            [&groups](const std::vector<std::size_t>& lhs, const std::vector<std::size_t>& rhs) {
+              return groups[lhs.front()].exact_id < groups[rhs.front()].exact_id;
+            });
+
+  picojson::array auto_components_json;
+  std::size_t merged_exact_id_count = 0;
+  for (const auto& component : auto_duplicate_components) {
+    merged_exact_id_count += component.size();
+    auto_components_json.emplace_back(to_json_auto_component(component, groups));
+  }
+
+  picojson::object library_defaults;
+  library_defaults["max_luminance_distance"] = picojson::value(
+      static_cast<double>(command.classification_options.similarity_options.max_luminance_distance));
+  library_defaults["max_alpha_distance"] = picojson::value(
+      static_cast<double>(command.classification_options.similarity_options.max_alpha_distance));
+  library_defaults["max_aspect_ratio_delta"] = picojson::value(
+      command.classification_options.similarity_options.max_aspect_ratio_delta);
+  library_defaults["min_dimension_ratio"] = picojson::value(
+      command.classification_options.similarity_options.min_dimension_ratio);
+
+  picojson::object report_buckets;
+  report_buckets["review_min_score"] =
+      picojson::value(command.classification_options.review_min_score);
+  report_buckets["auto_min_score"] =
+      picojson::value(command.classification_options.auto_min_score);
+  report_buckets["auto_max_luminance_distance"] = picojson::value(
+      static_cast<double>(command.classification_options.auto_max_luminance_distance));
+  report_buckets["auto_max_alpha_distance"] = picojson::value(
+      static_cast<double>(command.classification_options.auto_max_alpha_distance));
+  report_buckets["auto_max_aspect_ratio_delta"] = picojson::value(
+      command.classification_options.auto_max_aspect_ratio_delta);
+  report_buckets["auto_min_dimension_ratio"] = picojson::value(
+      command.classification_options.auto_min_dimension_ratio);
+  report_buckets["max_pairs"] = picojson::value(static_cast<double>(command.max_pairs));
+
+  picojson::object thresholds;
+  thresholds["library_defaults"] = picojson::value(library_defaults);
+  thresholds["report_buckets"] = picojson::value(report_buckets);
+
+  picojson::object output_root;
+  output_root["comparison_method"] = picojson::value("libatlas similarity signature");
+  output_root["pair_search_strategy"] = picojson::value("all_pairs_by_exact_id_group");
+  output_root["thresholds"] = picojson::value(thresholds);
+  output_root["exact_id_group_count"] = picojson::value(static_cast<double>(groups.size()));
+  output_root["auto_duplicate_candidate_count"] = picojson::value(static_cast<double>(auto_pair_count));
+  output_root["review_candidate_count"] = picojson::value(static_cast<double>(review_pair_count));
+  output_root["auto_duplicate_candidate_omitted_count"] = picojson::value(
+      static_cast<double>(auto_pair_count > auto_pairs.size() ? auto_pair_count - auto_pairs.size() : 0));
+  output_root["review_candidate_omitted_count"] = picojson::value(
+      static_cast<double>(review_pair_count > review_pairs.size() ? review_pair_count - review_pairs.size() : 0));
+  output_root["auto_duplicate_component_count"] =
+      picojson::value(static_cast<double>(auto_duplicate_components.size()));
+  output_root["auto_duplicate_component_exact_id_count"] =
+      picojson::value(static_cast<double>(merged_exact_id_count));
+  output_root["auto_duplicate_components"] = picojson::value(auto_components_json);
+  output_root["auto_duplicate_candidates"] = picojson::value(auto_pairs_json);
+  output_root["review_candidates"] = picojson::value(review_pairs_json);
+
+  if (!command.output_path.parent_path().empty()) {
+    fs::create_directories(command.output_path.parent_path());
+  }
+  write_text_file(command.output_path, picojson::value(output_root).serialize(true));
+}
+
 void print_usage() {
   std::cout
       << "libatlas_tool extract --atlas atlas.png --requests requests.json --output-dir out "
@@ -475,7 +982,11 @@ void print_usage() {
          "[--rounding expand|nearest|contract] [--no-trim] [--alpha-threshold N]\n"
       << "libatlas_tool pack --manifest pack.json --output-dir out --metadata metadata.json "
          "[--atlas-prefix atlas] [--max-width N] [--max-height N] [--padding N] "
-         "[--origin top-left|bottom-left]\n";
+         "[--origin top-left|bottom-left]\n"
+      << "libatlas_tool similarity-report --metadata-dir dir --output report.json "
+         "[--source-map source_map.json] [--review-min-score X] [--auto-min-score X] "
+         "[--auto-max-luminance-distance N] [--auto-max-alpha-distance N] "
+         "[--auto-max-aspect-ratio-delta X] [--auto-min-dimension-ratio X] [--max-pairs N]\n";
 }
 
 }  // namespace
@@ -494,6 +1005,10 @@ int main(int argc, char** argv) {
     }
     if (command == "pack") {
       run_pack(parse_pack_command(argc, argv));
+      return 0;
+    }
+    if (command == "similarity-report") {
+      run_similarity_report(parse_similarity_report_command(argc, argv));
       return 0;
     }
     if (command == "--help" || command == "-h") {

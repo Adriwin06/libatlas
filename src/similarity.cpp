@@ -191,4 +191,41 @@ SimilarityComparison compare_similarity(const SimilaritySignature& lhs,
   return comparison;
 }
 
+const char* similarity_candidate_kind_to_string(SimilarityCandidateKind kind) noexcept {
+  switch (kind) {
+    case SimilarityCandidateKind::None:
+      return "none";
+    case SimilarityCandidateKind::ReviewCandidate:
+      return "review_candidate";
+    case SimilarityCandidateKind::AutoDuplicateCandidate:
+      return "auto_duplicate_candidate";
+  }
+  return "none";
+}
+
+SimilarityClassification classify_similarity(const SimilaritySignature& lhs,
+                                             const SimilaritySignature& rhs,
+                                             const SimilarityClassificationOptions& options) {
+  SimilarityClassification classification;
+  classification.comparison = compare_similarity(lhs, rhs, options.similarity_options);
+  classification.alpha_coverage_delta = std::abs(lhs.alpha_coverage - rhs.alpha_coverage);
+
+  if (classification.comparison.likely_related &&
+      classification.comparison.score >= options.auto_min_score &&
+      classification.comparison.luminance_distance <= options.auto_max_luminance_distance &&
+      classification.comparison.alpha_distance <= options.auto_max_alpha_distance &&
+      classification.comparison.aspect_ratio_delta <= options.auto_max_aspect_ratio_delta &&
+      classification.comparison.dimension_ratio >= options.auto_min_dimension_ratio) {
+    classification.candidate_kind = SimilarityCandidateKind::AutoDuplicateCandidate;
+    return classification;
+  }
+
+  if (classification.comparison.likely_related &&
+      classification.comparison.score >= options.review_min_score) {
+    classification.candidate_kind = SimilarityCandidateKind::ReviewCandidate;
+  }
+
+  return classification;
+}
+
 }  // namespace libatlas

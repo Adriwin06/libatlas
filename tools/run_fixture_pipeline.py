@@ -52,6 +52,28 @@ class SourceResult:
     duration_seconds: float
 
 
+@dataclass(frozen=True)
+class OccurrenceRecord:
+    source_image: str
+    item_name: str
+    exact_id: str
+    trimmed_image: str | None
+
+
+@dataclass(frozen=True)
+class LogicalGroup:
+    logical_id: str
+    representative_exact_id: str
+    representative_name: str
+    representative_source_image: str
+    representative_trimmed_image: str | None
+    member_exact_ids: list[str]
+    occurrence_count: int
+    fixtures: list[str]
+    source_images: list[str]
+    merged_by_similarity: bool
+
+
 def parse_args() -> argparse.Namespace:
     repo_root = Path(__file__).resolve().parents[1]
 
@@ -91,6 +113,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Optional persistent asset-store directory passed to libatlas_tool extract. "
             "Unlike --work-dir, this directory is not deleted between runs."
+        ),
+    )
+    parser.add_argument(
+        "--logical-store",
+        type=Path,
+        default=repo_root / "build" / "fixture_logical_store",
+        help=(
+            "Persistent directory containing one editable image per logical texture group. "
+            "This directory is not deleted between runs."
         ),
     )
     parser.add_argument(
@@ -177,6 +208,54 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.5,
         help="Base delay in seconds before retrying a failed subprocess. Each retry uses delay * attempt.",
+    )
+    parser.add_argument(
+        "--similarity-review-min-score",
+        type=float,
+        default=0.90,
+        help=(
+            "Minimum libatlas similarity score for a non-exact pair to be emitted as a "
+            "manual-review candidate."
+        ),
+    )
+    parser.add_argument(
+        "--similarity-auto-min-score",
+        type=float,
+        default=0.92,
+        help=(
+            "Minimum libatlas similarity score for a non-exact pair to be emitted as a "
+            "high-confidence duplicate candidate."
+        ),
+    )
+    parser.add_argument(
+        "--similarity-auto-max-luminance-distance",
+        type=int,
+        default=8,
+        help="Maximum luminance hash Hamming distance for high-confidence duplicate candidates.",
+    )
+    parser.add_argument(
+        "--similarity-auto-max-alpha-distance",
+        type=int,
+        default=8,
+        help="Maximum alpha hash Hamming distance for high-confidence duplicate candidates.",
+    )
+    parser.add_argument(
+        "--similarity-auto-max-aspect-ratio-delta",
+        type=float,
+        default=0.10,
+        help="Maximum aspect-ratio delta for high-confidence duplicate candidates.",
+    )
+    parser.add_argument(
+        "--similarity-auto-min-dimension-ratio",
+        type=float,
+        default=0.90,
+        help="Minimum width/height ratio product for high-confidence duplicate candidates.",
+    )
+    parser.add_argument(
+        "--similarity-report-max-pairs",
+        type=int,
+        default=500,
+        help="Maximum pairs written per similarity bucket in the generated report.",
     )
     return parser.parse_args()
 
@@ -301,6 +380,218 @@ def sanitize_name(text: str) -> str:
         else:
             sanitized.append("_")
     return "".join(sanitized) or "item"
+
+
+def sorted_unique_strings(values: Iterable[str]) -> list[str]:
+    return sorted(set(values))
+
+
+def logical_id_from_exact_ids(exact_ids: list[str]) -> str:
+    return sanitize_name(min(exact_ids))
+
+
+def collect_occurrences(summary_items: list[dict[str, object]]) -> list[OccurrenceRecord]:
+    occurrences: list[OccurrenceRecord] = []
+    for fixture in summary_items:
+        source_image = fixture.get("source_image")
+        items = fixture.get("items")
+        if not isinstance(source_image, str) or not isinstance(items, list):
+            continue
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item_name = item.get("name")
+            exact_id = item.get("exact_id")
+            trimmed_image = item.get("trimmed_image")
+            if not isinstance(item_name, str) or not isinstance(exact_id, str):
+                continue
+            occurrences.append(
+                OccurrenceRecord(
+                    source_image=source_image,
+                    item_name=item_name,
+                    exact_id=exact_id,
+                    trimmed_image=trimmed_image if isinstance(trimmed_image, str) else None,
+                )
+            )
+    return occurrences
+
+
+def build_logical_groups(
+    occurrences: list[OccurrenceRecord],
+    similarity_report: dict[str, object],
+) -> list[LogicalGroup]:
+    occurrences_by_exact_id: defaultdict[str, list[OccurrenceRecord]] = defaultdict(list)
+    for occurrence in occurrences:
+        occurrences_by_exact_id[occurrence.exact_id].append(occurrence)
+
+    assigned_exact_ids: set[str] = set()
+    logical_groups: list[LogicalGroup] = []
+    auto_components = similarity_report.get("auto_duplicate_components")
+    if isinstance(auto_components, list):
+        for component in auto_components:
+            if not isinstance(component, dict):
+                continue
+            member_exact_ids = component.get("member_exact_ids")
+            if not isinstance(member_exact_ids, list):
+                continue
+            exact_ids = sorted(
+                exact_id
+                for exact_id in member_exact_ids
+                if isinstance(exact_id, str) and exact_id in occurrences_by_exact_id
+            )
+            if len(exact_ids) < 2:
+                continue
+            for exact_id in exact_ids:
+                assigned_exact_ids.add(exact_id)
+
+            representative_exact_id = min(
+                exact_ids,
+                key=lambda exact_id: (-len(occurrences_by_exact_id[exact_id]), exact_id),
+            )
+            representative_occurrence = min(
+                occurrences_by_exact_id[representative_exact_id],
+                key=lambda occurrence: occurrence.item_name,
+            )
+            member_occurrences = [occurrence for exact_id in exact_ids for occurrence in occurrences_by_exact_id[exact_id]]
+            logical_groups.append(
+                LogicalGroup(
+                    logical_id=logical_id_from_exact_ids(exact_ids),
+                    representative_exact_id=representative_exact_id,
+                    representative_name=representative_occurrence.item_name,
+                    representative_source_image=representative_occurrence.source_image,
+                    representative_trimmed_image=representative_occurrence.trimmed_image,
+                    member_exact_ids=exact_ids,
+                    occurrence_count=len(member_occurrences),
+                    fixtures=sorted_unique_strings(occurrence.item_name for occurrence in member_occurrences),
+                    source_images=sorted_unique_strings(occurrence.source_image for occurrence in member_occurrences),
+                    merged_by_similarity=True,
+                )
+            )
+
+    for exact_id in sorted(occurrences_by_exact_id):
+        if exact_id in assigned_exact_ids:
+            continue
+        exact_occurrences = occurrences_by_exact_id[exact_id]
+        representative_occurrence = min(exact_occurrences, key=lambda occurrence: occurrence.item_name)
+        logical_groups.append(
+            LogicalGroup(
+                logical_id=logical_id_from_exact_ids([exact_id]),
+                representative_exact_id=exact_id,
+                representative_name=representative_occurrence.item_name,
+                representative_source_image=representative_occurrence.source_image,
+                representative_trimmed_image=representative_occurrence.trimmed_image,
+                member_exact_ids=[exact_id],
+                occurrence_count=len(exact_occurrences),
+                fixtures=sorted_unique_strings(occurrence.item_name for occurrence in exact_occurrences),
+                source_images=sorted_unique_strings(occurrence.source_image for occurrence in exact_occurrences),
+                merged_by_similarity=False,
+            )
+        )
+
+    logical_groups.sort(key=lambda group: group.logical_id)
+    return logical_groups
+
+
+def materialize_logical_store(
+    logical_groups: list[LogicalGroup],
+    logical_store_dir: Path,
+) -> tuple[list[dict[str, str]], list[dict[str, object]]]:
+    images_dir = logical_store_dir / "images"
+    metadata_dir = logical_store_dir / "metadata"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+
+    pack_items: list[dict[str, str]] = []
+    metadata_items: list[dict[str, object]] = []
+    expected_filenames = {f"{group.logical_id}.png" for group in logical_groups}
+    for existing_image in images_dir.glob("*.png"):
+        if existing_image.name not in expected_filenames:
+            existing_image.unlink()
+
+    for group in logical_groups:
+        image_path = images_dir / f"{group.logical_id}.png"
+        existed_before_run = image_path.exists()
+        if not existed_before_run and group.representative_trimmed_image:
+            shutil.copy2(group.representative_trimmed_image, image_path)
+
+        if image_path.exists():
+            pack_items.append(
+                {
+                    "entry_id": group.logical_id,
+                    "image": str(image_path),
+                    "source_label": group.representative_name,
+                }
+            )
+
+        metadata_items.append(
+            {
+                "logical_id": group.logical_id,
+                "representative_exact_id": group.representative_exact_id,
+                "representative_name": group.representative_name,
+                "representative_source_image": group.representative_source_image,
+                "representative_trimmed_image": group.representative_trimmed_image,
+                "logical_image": str(image_path) if image_path.exists() else None,
+                "logical_image_existed_before_run": existed_before_run,
+                "member_exact_ids": group.member_exact_ids,
+                "member_exact_id_count": len(group.member_exact_ids),
+                "occurrence_count": group.occurrence_count,
+                "fixtures": group.fixtures,
+                "source_images": group.source_images,
+                "merged_by_similarity": group.merged_by_similarity,
+            }
+        )
+
+    return pack_items, metadata_items
+
+
+def build_occurrence_remap(
+    occurrences: list[OccurrenceRecord],
+    logical_groups: list[LogicalGroup],
+    pack_metadata: dict[str, object],
+) -> list[dict[str, object]]:
+    logical_id_by_exact_id: dict[str, str] = {}
+    for group in logical_groups:
+        for exact_id in group.member_exact_ids:
+            logical_id_by_exact_id[exact_id] = group.logical_id
+
+    atlases = pack_metadata.get("atlases")
+    placements = pack_metadata.get("placements")
+    atlas_identifier_by_index: dict[int, str] = {}
+    if isinstance(atlases, list):
+        for index, atlas in enumerate(atlases):
+            if isinstance(atlas, dict) and isinstance(atlas.get("atlas_identifier"), str):
+                atlas_identifier_by_index[index] = atlas["atlas_identifier"]
+
+    placement_by_entry_id: dict[str, dict[str, object]] = {}
+    if isinstance(placements, list):
+        for placement in placements:
+            if isinstance(placement, dict) and isinstance(placement.get("entry_id"), str):
+                placement_by_entry_id[placement["entry_id"]] = placement
+
+    remap_items: list[dict[str, object]] = []
+    for occurrence in occurrences:
+        logical_id = logical_id_by_exact_id.get(occurrence.exact_id)
+        if logical_id is None:
+            continue
+        placement = placement_by_entry_id.get(logical_id)
+        if placement is None:
+            continue
+        atlas_index = placement.get("atlas_index")
+        remap_items.append(
+            {
+                "source_image": occurrence.source_image,
+                "occurrence_name": occurrence.item_name,
+                "exact_id": occurrence.exact_id,
+                "logical_id": logical_id,
+                "atlas_index": atlas_index,
+                "atlas_identifier": atlas_identifier_by_index.get(int(atlas_index)) if isinstance(atlas_index, (int, float)) else None,
+                "pixel_rect": placement.get("pixel_rect"),
+                "uv_rect": placement.get("uv_rect"),
+            }
+        )
+    remap_items.sort(key=lambda item: (str(item["source_image"]), str(item["occurrence_name"])))
+    return remap_items
 
 
 def make_uv_rect(bbox: tuple[int, int, int, int], width: int, height: int) -> dict[str, float]:
@@ -675,6 +966,7 @@ def main() -> int:
     work_dir = args.work_dir.resolve()
     tool_path = args.tool.resolve() if args.tool else detect_tool_path(repo_root, args.config)
     asset_store_dir = args.asset_store.resolve() if args.asset_store else None
+    logical_store_dir = args.logical_store.resolve() if args.logical_store else None
 
     if not input_dir.exists():
         raise FileNotFoundError(f"Input directory does not exist: {input_dir}")
@@ -682,6 +974,22 @@ def main() -> int:
         raise ValueError("--command-retries must be at least 0")
     if args.retry_delay < 0:
         raise ValueError("--retry-delay must be at least 0")
+    if not 0.0 <= args.similarity_review_min_score <= 1.0:
+        raise ValueError("--similarity-review-min-score must be between 0 and 1")
+    if not 0.0 <= args.similarity_auto_min_score <= 1.0:
+        raise ValueError("--similarity-auto-min-score must be between 0 and 1")
+    if args.similarity_auto_min_score < args.similarity_review_min_score:
+        raise ValueError("--similarity-auto-min-score must be at least --similarity-review-min-score")
+    if args.similarity_auto_max_luminance_distance < 0:
+        raise ValueError("--similarity-auto-max-luminance-distance must be at least 0")
+    if args.similarity_auto_max_alpha_distance < 0:
+        raise ValueError("--similarity-auto-max-alpha-distance must be at least 0")
+    if args.similarity_auto_max_aspect_ratio_delta < 0.0:
+        raise ValueError("--similarity-auto-max-aspect-ratio-delta must be at least 0")
+    if not 0.0 <= args.similarity_auto_min_dimension_ratio <= 1.0:
+        raise ValueError("--similarity-auto-min-dimension-ratio must be between 0 and 1")
+    if args.similarity_report_max_pairs < 1:
+        raise ValueError("--similarity-report-max-pairs must be at least 1")
 
     sources = sorted(
         path for path in input_dir.iterdir() if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
@@ -697,6 +1005,7 @@ def main() -> int:
     LOGGER.info("Work directory: %s", work_dir)
     LOGGER.info("Tool: %s", tool_path)
     LOGGER.info("Asset store: %s", asset_store_dir if asset_store_dir else "(disabled)")
+    LOGGER.info("Logical store: %s", logical_store_dir if logical_store_dir else "(disabled)")
     LOGGER.info(
         "Subprocess retries: %d (base delay %.2fs).",
         args.command_retries,
@@ -714,6 +1023,9 @@ def main() -> int:
     pack_dir = work_dir / "packed"
     pack_manifest_path = work_dir / "metadata" / "pack_manifest.json"
     pack_metadata_path = work_dir / "metadata" / "packed.json"
+    occurrence_remap_path = work_dir / "metadata" / "occurrence_remap.json"
+    similarity_source_map_path = work_dir / "metadata" / "similarity_source_map.json"
+    similarity_report_path = work_dir / "metadata" / "similarity_report.json"
     summary_path = work_dir / "metadata" / "summary.json"
 
     for directory in (
@@ -761,7 +1073,7 @@ def main() -> int:
     source_stage_duration = time.perf_counter() - source_stage_started_at
 
     summary_items: list[dict[str, object]] = []
-    pack_items: list[dict[str, str]] = []
+    raw_pack_items: list[dict[str, str]] = []
     duplicate_groups: defaultdict[str, list[str]] = defaultdict(list)
     total_extractions = 0
     deduplicated_outputs = 0
@@ -769,17 +1081,60 @@ def main() -> int:
     for source_index in range(len(sources)):
         result = source_results[source_index]
         summary_items.append(result.summary_item)
-        pack_items.extend(result.pack_items)
+        raw_pack_items.extend(result.pack_items)
         for exact_id, item_name in result.duplicate_entries:
             duplicate_groups[exact_id].append(item_name)
         total_extractions += result.extraction_count
         deduplicated_outputs += result.deduplicated_outputs
 
-    write_json(pack_manifest_path, {"items": pack_items})
+    write_json(similarity_source_map_path, {source.stem: str(source) for source in sources})
+    run_command(
+        [
+            str(tool_path),
+            "similarity-report",
+            "--metadata-dir",
+            str(extract_metadata_dir),
+            "--output",
+            str(similarity_report_path),
+            "--source-map",
+            str(similarity_source_map_path),
+            "--review-min-score",
+            str(args.similarity_review_min_score),
+            "--auto-min-score",
+            str(args.similarity_auto_min_score),
+            "--auto-max-luminance-distance",
+            str(args.similarity_auto_max_luminance_distance),
+            "--auto-max-alpha-distance",
+            str(args.similarity_auto_max_alpha_distance),
+            "--auto-max-aspect-ratio-delta",
+            str(args.similarity_auto_max_aspect_ratio_delta),
+            "--auto-min-dimension-ratio",
+            str(args.similarity_auto_min_dimension_ratio),
+            "--max-pairs",
+            str(args.similarity_report_max_pairs),
+        ],
+        description="build similarity report",
+        retries=args.command_retries,
+        retry_delay_seconds=args.retry_delay,
+        cleanup_paths=(similarity_report_path,),
+    )
+    similarity_report = json.loads(similarity_report_path.read_text(encoding="utf-8"))
+
+    effective_logical_store_dir = logical_store_dir if logical_store_dir is not None else (work_dir / "logical_store")
+    occurrences = collect_occurrences(summary_items)
+    logical_groups = build_logical_groups(occurrences, similarity_report)
+    logical_pack_items, logical_group_metadata = materialize_logical_store(
+        logical_groups,
+        effective_logical_store_dir,
+    )
+    logical_group_metadata_path = effective_logical_store_dir / "metadata" / "logical_groups.json"
+    write_json(logical_group_metadata_path, {"logical_groups": logical_group_metadata})
+
+    write_json(pack_manifest_path, {"items": logical_pack_items})
 
     LOGGER.info(
-        "Packing %d trimmed image(s) with max atlas size %dx%d and padding %d.",
-        len(pack_items),
+        "Packing %d logical image(s) with max atlas size %dx%d and padding %d.",
+        len(logical_pack_items),
         args.max_width,
         args.max_height,
         args.padding,
@@ -806,7 +1161,7 @@ def main() -> int:
             "--origin",
             "top-left",
         ],
-        description="pack trimmed images",
+        description="pack logical images",
         retries=args.command_retries,
         retry_delay_seconds=args.retry_delay,
         cleanup_paths=(pack_dir, pack_metadata_path),
@@ -820,19 +1175,35 @@ def main() -> int:
     ]
 
     pack_metadata = json.loads(pack_metadata_path.read_text(encoding="utf-8"))
+    occurrence_remap = build_occurrence_remap(occurrences, logical_groups, pack_metadata)
+    write_json(occurrence_remap_path, {"occurrences": occurrence_remap})
     total_duration = time.perf_counter() - overall_started_at
     summary = {
         "tool": str(tool_path),
         "input_dir": str(input_dir),
         "work_dir": str(work_dir),
         "asset_store_dir": str(asset_store_dir) if asset_store_dir else None,
+        "logical_store_dir": str(effective_logical_store_dir),
         "worker_count": worker_count,
         "source_count": len(summary_items),
         "extraction_count": total_extractions,
-        "pack_item_count": len(pack_items),
+        "raw_pack_item_count": len(raw_pack_items),
+        "logical_texture_count": len(logical_groups),
+        "logical_pack_item_count": len(logical_pack_items),
+        "logical_similarity_merged_group_count": sum(
+            1 for group in logical_groups if group.merged_by_similarity
+        ),
         "deduplicated_identical_output_count": deduplicated_outputs,
         "packed_atlas_count": len(pack_metadata["atlases"]),
         "duplicate_exact_ids": duplicate_summary,
+        "similarity_report_json": str(similarity_report_path),
+        "logical_group_metadata_json": str(logical_group_metadata_path),
+        "occurrence_remap_json": str(occurrence_remap_path),
+        "similarity_candidate_counts": {
+            "auto_duplicate_candidates": similarity_report["auto_duplicate_candidate_count"],
+            "review_candidates": similarity_report["review_candidate_count"],
+            "auto_duplicate_components": similarity_report.get("auto_duplicate_component_count", 0),
+        },
         "timing_seconds": {
             "sources": source_stage_duration,
             "pack": pack_duration,
@@ -852,10 +1223,15 @@ def main() -> int:
     )
     LOGGER.info("Collapsed %d identical cropped/trimmed pair(s).", deduplicated_outputs)
     LOGGER.info(
-        "Packed %d trimmed image(s) into %d atlas(es) in %s.",
-        len(pack_items),
+        "Packed %d logical image(s) into %d atlas(es) in %s.",
+        len(logical_pack_items),
         len(pack_metadata["atlases"]),
         format_duration(pack_duration),
+    )
+    LOGGER.info(
+        "Similarity report: %d high-confidence candidate pair(s), %d review pair(s).",
+        similarity_report["auto_duplicate_candidate_count"],
+        similarity_report["review_candidate_count"],
     )
     LOGGER.info("Summary: %s", summary_path)
     return 0
