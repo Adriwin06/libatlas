@@ -391,6 +391,12 @@ def logical_id_from_exact_ids(exact_ids: list[str]) -> str:
     return sanitize_name(min(exact_ids))
 
 
+def canonical_review_pair(lhs: str, rhs: str) -> tuple[str, str]:
+    if lhs <= rhs:
+        return lhs, rhs
+    return rhs, lhs
+
+
 def collect_occurrences(summary_items: list[dict[str, object]]) -> list[OccurrenceRecord]:
     occurrences: list[OccurrenceRecord] = []
     for fixture in summary_items:
@@ -496,11 +502,12 @@ def build_logical_groups(
     return logical_groups
 
 
-def load_review_aliases(logical_store_dir: Path) -> dict[str, str]:
+def load_review_decisions(logical_store_dir: Path) -> tuple[dict[str, str], set[tuple[str, str]]]:
     decision_files = sorted(
         (logical_store_dir / "review_candidates" / "groups").glob("*/decision.json")
     )
     aliases: dict[str, str] = {}
+    distinct_pairs: set[tuple[str, str]] = set()
     for decision_path in decision_files:
         try:
             payload = json.loads(decision_path.read_text(encoding="utf-8"))
@@ -515,7 +522,20 @@ def load_review_aliases(logical_store_dir: Path) -> dict[str, str]:
             if not isinstance(loser_logical_id, str) or not isinstance(winner_logical_id, str):
                 continue
             aliases[loser_logical_id] = winner_logical_id
-    return aliases
+
+        raw_distinct_pairs = payload.get("distinct_pairs")
+        if not isinstance(raw_distinct_pairs, list):
+            continue
+        for entry in raw_distinct_pairs:
+            if not isinstance(entry, list) or len(entry) != 2:
+                continue
+            left_logical_id, right_logical_id = entry
+            if not isinstance(left_logical_id, str) or not isinstance(right_logical_id, str):
+                continue
+            if left_logical_id == right_logical_id:
+                continue
+            distinct_pairs.add(canonical_review_pair(left_logical_id, right_logical_id))
+    return aliases, distinct_pairs
 
 
 def apply_review_aliases(
@@ -590,6 +610,48 @@ def apply_review_aliases(
 
     merged_logical_groups.sort(key=lambda group: group.logical_id)
     return merged_logical_groups, resolved_aliases
+
+
+def normalize_review_distinct_pairs(
+    logical_groups: list[LogicalGroup],
+    review_distinct_pairs: set[tuple[str, str]],
+    applied_review_aliases: dict[str, str],
+) -> set[tuple[str, str]]:
+    if not review_distinct_pairs:
+        return set()
+
+    valid_logical_ids = {group.logical_id for group in logical_groups}
+
+    def resolve(logical_id: str) -> str:
+        current = logical_id
+        seen: set[str] = set()
+        while current in applied_review_aliases:
+            if current in seen:
+                raise ValueError(f"Cycle detected while resolving distinct review pair at {current}")
+            seen.add(current)
+            current = applied_review_aliases[current]
+        return current
+
+    normalized_pairs: set[tuple[str, str]] = set()
+    ignored_pair_count = 0
+    for left_logical_id, right_logical_id in review_distinct_pairs:
+        resolved_left = resolve(left_logical_id)
+        resolved_right = resolve(right_logical_id)
+        if resolved_left == resolved_right:
+            ignored_pair_count += 1
+            continue
+        if resolved_left not in valid_logical_ids or resolved_right not in valid_logical_ids:
+            ignored_pair_count += 1
+            continue
+        normalized_pairs.add(canonical_review_pair(resolved_left, resolved_right))
+
+    if ignored_pair_count > 0:
+        LOGGER.warning(
+            "Ignored %d stale or redundant distinct review pair decision(s).",
+            ignored_pair_count,
+        )
+
+    return normalized_pairs
 
 
 def materialize_logical_store(
@@ -715,10 +777,64 @@ def make_review_group_id(logical_ids: list[str], representative_name: str) -> st
     return f"group__{len(logical_ids):02d}_items__{sanitize_name(representative_name)}__{logical_ids[0]}"
 
 
+def build_review_groups_from_candidate_pairs(
+    review_candidates: list[object],
+    logical_id_by_exact_id: dict[str, str],
+    excluded_pairs: set[tuple[str, str]],
+) -> list[list[str]]:
+    parent: dict[str, str] = {}
+
+    def find(value: str) -> str:
+        root = parent.setdefault(value, value)
+        if root != value:
+            parent[value] = find(root)
+        return parent[value]
+
+    def union(lhs: str, rhs: str) -> None:
+        left_root = find(lhs)
+        right_root = find(rhs)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    review_logical_ids: set[str] = set()
+    for candidate in review_candidates:
+        if not isinstance(candidate, dict):
+            continue
+        left = candidate.get("left")
+        right = candidate.get("right")
+        if not isinstance(left, dict) or not isinstance(right, dict):
+            continue
+        left_exact_id = left.get("exact_id")
+        right_exact_id = right.get("exact_id")
+        if not isinstance(left_exact_id, str) or not isinstance(right_exact_id, str):
+            continue
+        left_logical_id = logical_id_by_exact_id.get(left_exact_id)
+        right_logical_id = logical_id_by_exact_id.get(right_exact_id)
+        if not left_logical_id or not right_logical_id or left_logical_id == right_logical_id:
+            continue
+        if canonical_review_pair(left_logical_id, right_logical_id) in excluded_pairs:
+            continue
+        review_logical_ids.update((left_logical_id, right_logical_id))
+        union(left_logical_id, right_logical_id)
+
+    clustered_logical_ids: defaultdict[str, list[str]] = defaultdict(list)
+    for logical_id in sorted(review_logical_ids):
+        clustered_logical_ids[find(logical_id)].append(logical_id)
+
+    review_groups = [
+        sorted(logical_ids)
+        for logical_ids in clustered_logical_ids.values()
+        if len(logical_ids) > 1
+    ]
+    review_groups.sort(key=lambda logical_ids: logical_ids[0])
+    return review_groups
+
+
 def materialize_review_candidates(
     similarity_report: dict[str, object],
     logical_groups: list[LogicalGroup],
     logical_store_dir: Path,
+    review_distinct_pairs: set[tuple[str, str]],
 ) -> tuple[Path, dict[str, object]]:
     review_root = logical_store_dir / "review_candidates"
     groups_dir = review_root / "groups"
@@ -745,72 +861,41 @@ def materialize_review_candidates(
         for exact_id in group.member_exact_ids:
             logical_id_by_exact_id[exact_id] = group.logical_id
 
-    review_component_members: list[list[str]] = []
     review_components = similarity_report.get("review_components")
-    if isinstance(review_components, list):
-        for component in review_components:
-            if not isinstance(component, dict):
-                continue
-            member_exact_ids = component.get("member_exact_ids")
-            if not isinstance(member_exact_ids, list):
-                continue
-            logical_ids = sorted_unique_strings(
-                logical_id_by_exact_id[exact_id]
-                for exact_id in member_exact_ids
-                if isinstance(exact_id, str) and exact_id in logical_id_by_exact_id
-            )
-            if len(logical_ids) > 1:
-                review_component_members.append(logical_ids)
+    review_candidates = similarity_report.get("review_candidates")
+    omitted_review_pair_count = similarity_report.get("review_candidate_omitted_count", 0)
+    review_groups: list[list[str]]
+    if isinstance(review_candidates, list) and int(omitted_review_pair_count) == 0:
+        review_groups = build_review_groups_from_candidate_pairs(
+            review_candidates,
+            logical_id_by_exact_id,
+            review_distinct_pairs,
+        )
     else:
-        review_candidates = similarity_report.get("review_candidates")
-        if isinstance(review_candidates, list):
-            for candidate in review_candidates:
-                if not isinstance(candidate, dict):
+        if review_distinct_pairs and int(omitted_review_pair_count) > 0:
+            LOGGER.warning(
+                "Review candidate pairs were truncated (%s omitted); distinct review decisions may not fully split large review clusters. Increase --similarity-report-max-pairs to avoid truncation.",
+                omitted_review_pair_count,
+            )
+        review_groups = []
+        if isinstance(review_components, list):
+            for component in review_components:
+                if not isinstance(component, dict):
                     continue
-                left = candidate.get("left")
-                right = candidate.get("right")
-                if not isinstance(left, dict) or not isinstance(right, dict):
+                member_exact_ids = component.get("member_exact_ids")
+                if not isinstance(member_exact_ids, list):
                     continue
-                left_exact_id = left.get("exact_id")
-                right_exact_id = right.get("exact_id")
-                if not isinstance(left_exact_id, str) or not isinstance(right_exact_id, str):
+                logical_ids = sorted_unique_strings(
+                    logical_id_by_exact_id[exact_id]
+                    for exact_id in member_exact_ids
+                    if isinstance(exact_id, str) and exact_id in logical_id_by_exact_id
+                )
+                if len(logical_ids) <= 1:
                     continue
-                left_logical_id = logical_id_by_exact_id.get(left_exact_id)
-                right_logical_id = logical_id_by_exact_id.get(right_exact_id)
-                if left_logical_id and right_logical_id and left_logical_id != right_logical_id:
-                    review_component_members.append(sorted([left_logical_id, right_logical_id]))
-
-    parent: dict[str, str] = {}
-
-    def find(value: str) -> str:
-        root = parent.setdefault(value, value)
-        if root != value:
-            parent[value] = find(root)
-        return parent[value]
-
-    def union(lhs: str, rhs: str) -> None:
-        left_root = find(lhs)
-        right_root = find(rhs)
-        if left_root != right_root:
-            parent[right_root] = left_root
-
-    review_logical_ids: set[str] = set()
-    for logical_ids in review_component_members:
-        review_logical_ids.update(logical_ids)
-        leader = logical_ids[0]
-        for logical_id in logical_ids[1:]:
-            union(leader, logical_id)
-
-    clustered_logical_ids: defaultdict[str, list[str]] = defaultdict(list)
-    for logical_id in sorted(review_logical_ids):
-        clustered_logical_ids[find(logical_id)].append(logical_id)
-
-    review_groups = [
-        sorted(logical_ids)
-        for logical_ids in clustered_logical_ids.values()
-        if len(logical_ids) > 1
-    ]
-    review_groups.sort(key=lambda logical_ids: logical_ids[0])
+                if len(logical_ids) == 2 and canonical_review_pair(logical_ids[0], logical_ids[1]) in review_distinct_pairs:
+                    continue
+                review_groups.append(logical_ids)
+        review_groups.sort(key=lambda logical_ids: logical_ids[0])
 
     exported_image_count = 0
     manifest_groups: list[dict[str, object]] = []
@@ -873,11 +958,28 @@ def materialize_review_candidates(
             and winner_logical_id in logical_ids
             and loser_logical_id != winner_logical_id
         }
+        raw_distinct_pairs = preserved_decision.get("distinct_pairs")
+        decision_distinct_pairs: list[list[str]] = []
+        if isinstance(raw_distinct_pairs, list):
+            filtered_distinct_pairs = {
+                canonical_review_pair(left_logical_id, right_logical_id)
+                for entry in raw_distinct_pairs
+                if isinstance(entry, list)
+                and len(entry) == 2
+                and isinstance(entry[0], str)
+                and isinstance(entry[1], str)
+                and entry[0] in logical_ids
+                and entry[1] in logical_ids
+                and entry[0] != entry[1]
+                for left_logical_id, right_logical_id in [entry]
+            }
+            decision_distinct_pairs = [list(pair) for pair in sorted(filtered_distinct_pairs)]
         decision_payload = {
             "group_id": group_name,
             "status": preserved_decision.get("status", "pending"),
             "notes": preserved_decision.get("notes", ""),
             "aliases": decision_aliases,
+            "distinct_pairs": decision_distinct_pairs,
             "available_logical_ids": logical_ids,
         }
         write_json(group_dir / "decision.json", decision_payload)
@@ -1497,8 +1599,13 @@ def main() -> int:
     effective_logical_store_dir = logical_store_dir if logical_store_dir is not None else (work_dir / "logical_store")
     occurrences = collect_occurrences(summary_items)
     logical_groups = build_logical_groups(occurrences, similarity_report)
-    review_aliases = load_review_aliases(effective_logical_store_dir)
+    review_aliases, review_distinct_pairs = load_review_decisions(effective_logical_store_dir)
     logical_groups, applied_review_aliases = apply_review_aliases(logical_groups, review_aliases)
+    applied_review_distinct_pairs = normalize_review_distinct_pairs(
+        logical_groups,
+        review_distinct_pairs,
+        applied_review_aliases,
+    )
     logical_pack_items, logical_group_metadata = materialize_logical_store(
         logical_groups,
         effective_logical_store_dir,
@@ -1509,6 +1616,7 @@ def main() -> int:
         similarity_report,
         logical_groups,
         effective_logical_store_dir,
+        applied_review_distinct_pairs,
     )
 
     write_json(pack_manifest_path, {"items": logical_pack_items})
@@ -1578,6 +1686,7 @@ def main() -> int:
             1 for group in logical_groups if group.merged_by_review
         ),
         "applied_review_alias_count": len(applied_review_aliases),
+        "applied_review_distinct_pair_count": len(applied_review_distinct_pairs),
         "deduplicated_identical_output_count": deduplicated_outputs,
         "packed_atlas_count": len(pack_metadata["atlases"]),
         "duplicate_exact_ids": duplicate_summary,
@@ -1624,6 +1733,10 @@ def main() -> int:
         similarity_report["review_candidate_count"],
     )
     LOGGER.info("Applied %d manual review alias decision(s).", len(applied_review_aliases))
+    LOGGER.info(
+        "Applied %d manual distinct review pair decision(s).",
+        len(applied_review_distinct_pairs),
+    )
     LOGGER.info(
         "Review candidates: %d pair(s), %d cluster folder(s), %d linked image(s), folder=%s",
         review_manifest["review_candidate_pair_count"],

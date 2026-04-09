@@ -261,7 +261,8 @@ The logical store layout is:
 logical-group metadata directly. Instead they record aliases from loser logical IDs to the winner
 logical ID inside each review group folder, then rerun the fixture pipeline. The script applies
 those decisions automatically, rebuilds the logical groups, updates remap metadata, and removes
-resolved review clusters.
+resolved review clusters. `decision.json` can also persist `distinct_pairs` so reviewed items that
+are confirmed different stop resurfacing as the same unresolved review cluster.
 
 Example review decision:
 
@@ -273,12 +274,23 @@ Example review decision:
   "aliases": {
     "sha256_v1_loser": "sha256_v1_winner"
   },
+  "distinct_pairs": [],
   "available_logical_ids": [
     "sha256_v1_winner",
     "sha256_v1_loser"
   ]
 }
 ```
+
+If you want a desktop wrapper around that workflow, run:
+
+```bash
+python tools/fixture_pipeline_ui/main.py
+```
+
+The UI lets you select the source atlas folder, choose a workspace root where
+`fixture_asset_store/`, `fixture_logical_store/`, and `fixture_pipeline/` will be created, run the
+pipeline, and review candidate groups by marking logical images as the same or different.
 
 To use a persistent store across fixture runs:
 
