@@ -71,6 +71,7 @@ Typical `libatlas` outputs your parser-side tool may store:
 - cropped exact ID
 - exact ID
 - similarity signature
+- similarity classification results
 - crop and trim rectangles
 - cache outcome
 - warnings
@@ -97,7 +98,9 @@ For atlas comparison or merge workflows:
 3. Group by `metadata.exact_id`
 4. Treat those groups as strict duplicate candidates
 5. Compare `metadata.similarity_signature` for non-exact candidates
-6. Decide which image to keep or replace
+6. Classify those candidates into auto-merge and review buckets
+7. Record any manual review aliases from loser logical IDs to the winner logical ID
+8. Rebuild the logical groups and repack from the surviving logical IDs
 
 That works even when:
 
@@ -105,12 +108,23 @@ That works even when:
 - one version has extra transparent padding
 - UV rounding produced slightly different crops
 
+The library and CLI now support that split explicitly:
+
+- `compare_similarity(...)`
+  - raw score plus `likely_related`
+- `classify_similarity(...)`
+  - applies the higher-level candidate thresholds
+- `libatlas_tool similarity-report`
+  - emits connected components for auto-duplicate and review clusters
+
 ## Replacement Workflow
 
 If you want to replace low-resolution art:
 
 1. Extract and identify textures
-2. Choose a logical key for each texture, usually `exact_id`
+2. Choose a logical key for each texture
+   - exact-only workflow: usually `exact_id`
+   - reviewed workflow: a logical-store ID that may merge several reviewed exact IDs
 3. Attach a replacement image to that key
 4. Feed the replacement image into `PackItem`
 5. Pack and update downstream UV references
@@ -144,6 +158,14 @@ The intended pattern is:
 5. Preload those stored IDs into `ExtractionIdentityCache` on later runs
 
 `libatlas_tool extract --asset-store <dir>` implements exactly that pattern for PNG-based debugging and validation workflows.
+
+If you also want a human-reviewable replacement workflow, keep a second persistent logical store:
+
+1. Start from exact IDs and similarity reports
+2. Materialize one editable image per logical group
+3. Materialize review-group folders with contact sheets and manifests
+4. Record decisions in per-group `decision.json` files
+5. Re-run the pipeline to apply aliases and rebuild packed placements
 
 ## Migration From Parser-Coupled Tools
 

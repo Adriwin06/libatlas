@@ -84,17 +84,28 @@ That is important because you usually still need provenance:
 - which geometry or request referenced it
 - which UVs produced it
 
+The store also does not merge near-duplicate textures. Similar-but-non-exact candidates remain
+separate canonical entries until a higher-level workflow chooses a winner.
+
 ## Typical Workflow
 
 1. Run `libatlas_tool extract --asset-store <dir> ...`
 2. Let the tool populate or reuse the store
-3. Group or edit canonical textures by `exact_id`
-4. Use `libatlas` workflow helpers or your own tool logic to repack unique textures
-5. Remap original occurrences back to packed atlas placements
+3. Optionally generate similarity reports for non-exact candidates
+4. Build or update a logical store that maps reviewed near-duplicates onto one editable image
+5. Use `libatlas` workflow helpers or your own tool logic to repack logical textures
+6. Remap original occurrences back to packed atlas placements
+
+The key boundary is:
+
+- asset store
+  - exact, content-addressed cache
+- logical store
+  - human-reviewed grouping layer used for replacement and repacking
 
 ## Limitations
 
 - the store is file-based, not a relational database
 - metadata is JSON and optimized for transparency, not extreme scale
 - near-duplicate matching is still advisory; the store only auto-deduplicates exact IDs
-- the current CLI only writes the store during extraction; higher-level manifest generation and repacking policy remain caller-driven
+- the current CLI only writes the store during extraction; logical grouping and review policy remain caller-driven

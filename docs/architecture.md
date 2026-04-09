@@ -22,6 +22,7 @@ The project is split into three layers:
    - extraction and trimming
    - deterministic canonical IDs
    - near-duplicate signatures
+   - near-duplicate classification
    - deterministic atlas packing
 
 2. Convenience I/O
@@ -30,6 +31,9 @@ The project is split into three layers:
 
 3. Tooling
    - CLI for extraction and repacking
+   - similarity report generation
+   - logical-store materialization
+   - review-cluster folders and decision files
    - tests
    - example program
 
@@ -80,8 +84,12 @@ Public headers:
   - `SimilarityOptions`
   - `SimilaritySignature`
   - `SimilarityComparison`
+  - `SimilarityCandidateKind`
+  - `SimilarityClassificationOptions`
+  - `SimilarityClassification`
   - `compute_similarity_signature`
   - `compare_similarity`
+  - `classify_similarity`
 
 - `include/libatlas/packing.hpp`
   - `PackItem`
@@ -299,8 +307,17 @@ Version 1 comparison plan:
 - produce a similarity score and `likely_related` boolean
   - strict bit-distance thresholds remain available
   - a score-based fallback is also used for small assets where one-pixel differences can move many normalized hash bits
+- classify candidates into:
+  - `AutoDuplicateCandidate`
+  - `ReviewCandidate`
+  - `None`
 
 This is intentionally conservative. Resized textures or shifted crops may score as likely related, but the library will not claim they are exact duplicates unless the canonical hashes match.
+
+Higher-level decisions still live in the tool layer:
+
+- the library can say whether two signatures look like an auto-merge or review candidate
+- the caller decides whether to actually merge reviewed items and how to persist that choice
 
 ## Atlas Packing Approach
 
@@ -356,6 +373,20 @@ The CLI can maintain a content-addressed asset store keyed by:
 - logical exact ID for canonical textures
 
 That store can be reused across runs to preload the extraction cache. This keeps the core library stateless while still enabling long-lived deduplicated asset databases in real tools.
+
+The current fixture pipeline also maintains a separate logical store in the tool layer:
+
+- one editable image per current logical texture group
+- review-cluster folders containing:
+  - linked/copied logical images
+  - contact sheets
+  - per-group manifests
+  - `decision.json` files
+
+Those `decision.json` files express loser-to-winner logical-ID aliases. On rerun, the tool applies
+those aliases, rebuilds the logical groups, rewrites the remap metadata, and repacks from the
+surviving logical images. This remains outside the core library because it is workflow policy, not
+image-processing semantics.
 
 ## Error Handling Strategy
 

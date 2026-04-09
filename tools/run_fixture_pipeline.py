@@ -72,6 +72,7 @@ class LogicalGroup:
     fixtures: list[str]
     source_images: list[str]
     merged_by_similarity: bool
+    merged_by_review: bool
 
 
 def parse_args() -> argparse.Namespace:
@@ -466,6 +467,7 @@ def build_logical_groups(
                     fixtures=sorted_unique_strings(occurrence.item_name for occurrence in member_occurrences),
                     source_images=sorted_unique_strings(occurrence.source_image for occurrence in member_occurrences),
                     merged_by_similarity=True,
+                    merged_by_review=False,
                 )
             )
 
@@ -486,11 +488,108 @@ def build_logical_groups(
                 fixtures=sorted_unique_strings(occurrence.item_name for occurrence in exact_occurrences),
                 source_images=sorted_unique_strings(occurrence.source_image for occurrence in exact_occurrences),
                 merged_by_similarity=False,
+                merged_by_review=False,
             )
         )
 
     logical_groups.sort(key=lambda group: group.logical_id)
     return logical_groups
+
+
+def load_review_aliases(logical_store_dir: Path) -> dict[str, str]:
+    decision_files = sorted(
+        (logical_store_dir / "review_candidates" / "groups").glob("*/decision.json")
+    )
+    aliases: dict[str, str] = {}
+    for decision_path in decision_files:
+        try:
+            payload = json.loads(decision_path.read_text(encoding="utf-8"))
+        except Exception as error:
+            LOGGER.warning("Skipping invalid review decision file %s: %s", decision_path, error)
+            continue
+
+        alias_map = payload.get("aliases")
+        if not isinstance(alias_map, dict):
+            continue
+        for loser_logical_id, winner_logical_id in alias_map.items():
+            if not isinstance(loser_logical_id, str) or not isinstance(winner_logical_id, str):
+                continue
+            aliases[loser_logical_id] = winner_logical_id
+    return aliases
+
+
+def apply_review_aliases(
+    logical_groups: list[LogicalGroup],
+    review_aliases: dict[str, str],
+) -> tuple[list[LogicalGroup], dict[str, str]]:
+    if not review_aliases:
+        return logical_groups, {}
+
+    groups_by_id = {group.logical_id: group for group in logical_groups}
+    valid_review_aliases = {
+        loser_logical_id: winner_logical_id
+        for loser_logical_id, winner_logical_id in review_aliases.items()
+        if loser_logical_id in groups_by_id and winner_logical_id in groups_by_id
+    }
+    ignored_alias_count = len(review_aliases) - len(valid_review_aliases)
+    if ignored_alias_count > 0:
+        LOGGER.warning(
+            "Ignored %d stale review alias decision(s) that no longer match current logical groups.",
+            ignored_alias_count,
+        )
+
+    def resolve(logical_id: str) -> str:
+        seen: set[str] = set()
+        current = logical_id
+        while current in valid_review_aliases:
+            if current in seen:
+                raise ValueError(f"Cycle detected in review aliases at {current}")
+            seen.add(current)
+            current = valid_review_aliases[current]
+        return current
+
+    resolved_aliases: dict[str, str] = {}
+    merged_groups_by_root: defaultdict[str, list[LogicalGroup]] = defaultdict(list)
+    for group in logical_groups:
+        root_logical_id = resolve(group.logical_id)
+        merged_groups_by_root[root_logical_id].append(group)
+        if group.logical_id != root_logical_id:
+            resolved_aliases[group.logical_id] = root_logical_id
+
+    merged_logical_groups: list[LogicalGroup] = []
+    for root_logical_id, component_groups in merged_groups_by_root.items():
+        root_group = groups_by_id[root_logical_id]
+        if len(component_groups) == 1:
+            merged_logical_groups.append(root_group)
+            continue
+
+        member_exact_ids = sorted_unique_strings(
+            exact_id for group in component_groups for exact_id in group.member_exact_ids
+        )
+        fixtures = sorted_unique_strings(
+            fixture for group in component_groups for fixture in group.fixtures
+        )
+        source_images = sorted_unique_strings(
+            source_image for group in component_groups for source_image in group.source_images
+        )
+        merged_logical_groups.append(
+            LogicalGroup(
+                logical_id=root_group.logical_id,
+                representative_exact_id=root_group.representative_exact_id,
+                representative_name=root_group.representative_name,
+                representative_source_image=root_group.representative_source_image,
+                representative_trimmed_image=root_group.representative_trimmed_image,
+                member_exact_ids=member_exact_ids,
+                occurrence_count=sum(group.occurrence_count for group in component_groups),
+                fixtures=fixtures,
+                source_images=source_images,
+                merged_by_similarity=any(group.merged_by_similarity for group in component_groups),
+                merged_by_review=True,
+            )
+        )
+
+    merged_logical_groups.sort(key=lambda group: group.logical_id)
+    return merged_logical_groups, resolved_aliases
 
 
 def materialize_logical_store(
@@ -539,6 +638,7 @@ def materialize_logical_store(
                 "fixtures": group.fixtures,
                 "source_images": group.source_images,
                 "merged_by_similarity": group.merged_by_similarity,
+                "merged_by_review": group.merged_by_review,
             }
         )
 
@@ -611,6 +711,10 @@ def create_review_contact_sheet(
     sheet.save(output_path)
 
 
+def make_review_group_id(logical_ids: list[str], representative_name: str) -> str:
+    return f"group__{len(logical_ids):02d}_items__{sanitize_name(representative_name)}__{logical_ids[0]}"
+
+
 def materialize_review_candidates(
     similarity_report: dict[str, object],
     logical_groups: list[LogicalGroup],
@@ -619,6 +723,17 @@ def materialize_review_candidates(
     review_root = logical_store_dir / "review_candidates"
     groups_dir = review_root / "groups"
     manifest_path = review_root / "review_groups.json"
+
+    preserved_decisions: dict[str, dict[str, object]] = {}
+    if groups_dir.exists():
+        for decision_path in groups_dir.glob("*/decision.json"):
+            try:
+                payload = json.loads(decision_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            group_id = payload.get("group_id")
+            if isinstance(group_id, str):
+                preserved_decisions[group_id] = payload
 
     if review_root.exists():
         shutil.rmtree(review_root)
@@ -701,7 +816,7 @@ def materialize_review_candidates(
     manifest_groups: list[dict[str, object]] = []
     for index, logical_ids in enumerate(review_groups, start=1):
         representative_name = logical_group_by_id[logical_ids[0]].representative_name
-        group_name = f"group_{index:04d}__{len(logical_ids):02d}_items__{sanitize_name(representative_name)}"
+        group_name = make_review_group_id(logical_ids, representative_name)
         group_dir = groups_dir / group_name
         members_dir = group_dir / "images"
         members_dir.mkdir(parents=True, exist_ok=True)
@@ -735,6 +850,7 @@ def materialize_review_candidates(
                     "fixtures": group.fixtures,
                     "source_images": group.source_images,
                     "merged_by_similarity": group.merged_by_similarity,
+                    "merged_by_review": group.merged_by_review,
                 }
             )
             member_exact_ids.extend(group.member_exact_ids)
@@ -743,6 +859,28 @@ def materialize_review_candidates(
 
         contact_sheet_path = group_dir / "contact_sheet.png"
         create_review_contact_sheet(member_records, contact_sheet_path)
+
+        preserved_decision = preserved_decisions.get(group_name, {})
+        decision_aliases = preserved_decision.get("aliases")
+        if not isinstance(decision_aliases, dict):
+            decision_aliases = {}
+        decision_aliases = {
+            loser_logical_id: winner_logical_id
+            for loser_logical_id, winner_logical_id in decision_aliases.items()
+            if isinstance(loser_logical_id, str)
+            and isinstance(winner_logical_id, str)
+            and loser_logical_id in logical_ids
+            and winner_logical_id in logical_ids
+            and loser_logical_id != winner_logical_id
+        }
+        decision_payload = {
+            "group_id": group_name,
+            "status": preserved_decision.get("status", "pending"),
+            "notes": preserved_decision.get("notes", ""),
+            "aliases": decision_aliases,
+            "available_logical_ids": logical_ids,
+        }
+        write_json(group_dir / "decision.json", decision_payload)
 
         group_manifest = {
             "group_id": group_name,
@@ -762,6 +900,7 @@ def materialize_review_candidates(
                 "group_id": group_name,
                 "path": str(group_dir),
                 "contact_sheet": str(contact_sheet_path),
+                "decision_json": str(group_dir / "decision.json"),
                 "logical_id_count": group_manifest["logical_id_count"],
                 "member_exact_id_count": group_manifest["member_exact_id_count"],
                 "member_occurrence_count": group_manifest["member_occurrence_count"],
@@ -1358,6 +1497,8 @@ def main() -> int:
     effective_logical_store_dir = logical_store_dir if logical_store_dir is not None else (work_dir / "logical_store")
     occurrences = collect_occurrences(summary_items)
     logical_groups = build_logical_groups(occurrences, similarity_report)
+    review_aliases = load_review_aliases(effective_logical_store_dir)
+    logical_groups, applied_review_aliases = apply_review_aliases(logical_groups, review_aliases)
     logical_pack_items, logical_group_metadata = materialize_logical_store(
         logical_groups,
         effective_logical_store_dir,
@@ -1433,6 +1574,10 @@ def main() -> int:
         "logical_similarity_merged_group_count": sum(
             1 for group in logical_groups if group.merged_by_similarity
         ),
+        "logical_review_merged_group_count": sum(
+            1 for group in logical_groups if group.merged_by_review
+        ),
+        "applied_review_alias_count": len(applied_review_aliases),
         "deduplicated_identical_output_count": deduplicated_outputs,
         "packed_atlas_count": len(pack_metadata["atlases"]),
         "duplicate_exact_ids": duplicate_summary,
@@ -1478,6 +1623,7 @@ def main() -> int:
         similarity_report["auto_duplicate_candidate_count"],
         similarity_report["review_candidate_count"],
     )
+    LOGGER.info("Applied %d manual review alias decision(s).", len(applied_review_aliases))
     LOGGER.info(
         "Review candidates: %d pair(s), %d cluster folder(s), %d linked image(s), folder=%s",
         review_manifest["review_candidate_pair_count"],

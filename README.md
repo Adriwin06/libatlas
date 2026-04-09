@@ -12,6 +12,7 @@ It is designed for APT/FLAPT-adjacent workflows such as Burnout Paradise HUD and
 - Computes both raw-crop and trimmed deterministic IDs
 - Computes deterministic exact texture IDs from canonicalized pixel content
 - Computes lightweight near-duplicate signatures for candidate matching
+- Classifies near-duplicate candidates into auto-merge and review buckets
 - Rebuilds one or more deterministic output atlases with regenerated UVs
 - Supports replacing extracted content with higher-resolution images before packing
 - Provides cached extraction and a persistent asset-store option in the CLI
@@ -219,7 +220,13 @@ libatlas_tool similarity-report \
 ```
 
 This command reads extraction metadata JSON files, groups strict matches by `exact_id`, and emits
-a report of non-exact candidate pairs using the library's similarity classification rules.
+a report of:
+
+- high-confidence non-exact duplicate pairs
+- review-only candidate pairs
+- connected components for both auto-duplicate and review candidate groups
+
+The classification policy comes from the C++ similarity API rather than the Python fixture script.
 
 ### Fixture Smoke Run
 
@@ -235,6 +242,43 @@ By default the script writes converted PNGs, per-image extraction metadata, pack
 It also maintains a persistent logical image store under `build/fixture_logical_store/` by default.
 That folder contains one editable PNG per logical texture group. When the pipeline packs outputs,
 all occurrences mapped to the same logical group reuse that one image.
+
+The logical store layout is:
+
+- `images/`
+  - one editable PNG per current logical texture group
+- `metadata/logical_groups.json`
+  - the current logical groups and which exact IDs they contain
+- `review_candidates/groups/`
+  - one folder per unresolved review cluster
+  - each folder contains:
+    - `images/`
+    - `contact_sheet.png`
+    - `group.json`
+    - `decision.json`
+
+`decision.json` is the automation point for manual review. Reviewers do not edit the main
+logical-group metadata directly. Instead they record aliases from loser logical IDs to the winner
+logical ID inside each review group folder, then rerun the fixture pipeline. The script applies
+those decisions automatically, rebuilds the logical groups, updates remap metadata, and removes
+resolved review clusters.
+
+Example review decision:
+
+```json
+{
+  "group_id": "group__02_items__example",
+  "status": "reviewed",
+  "notes": "Same icon with compression noise.",
+  "aliases": {
+    "sha256_v1_loser": "sha256_v1_winner"
+  },
+  "available_logical_ids": [
+    "sha256_v1_winner",
+    "sha256_v1_loser"
+  ]
+}
+```
 
 To use a persistent store across fixture runs:
 
@@ -261,6 +305,8 @@ Vendored convenience dependencies:
 - Trimming fully transparent borders can make two crops with different transparent padding share the same exact ID
 - Two-pass cached extraction first checks the raw crop ID, then falls back to the trimmed exact ID
 - Near-duplicate matching is advisory, not identity
+- The asset store only auto-deduplicates exact IDs
+- The logical store can additionally merge reviewed near-duplicates through `decision.json` aliases
 - Fully transparent trimmed results canonicalize to `0 x 0`
 - The packer is deterministic and shelf-based, not globally optimal
 - Zero-sized images are not packable and must be handled by the caller
