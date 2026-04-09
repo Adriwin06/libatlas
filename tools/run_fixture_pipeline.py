@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
 
 LOGGER = logging.getLogger("fixture_pipeline")
@@ -543,6 +543,241 @@ def materialize_logical_store(
         )
 
     return pack_items, metadata_items
+
+
+def link_or_copy_file(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        destination.unlink()
+    try:
+        os.link(source, destination)
+    except OSError:
+        shutil.copy2(source, destination)
+
+
+def create_review_contact_sheet(
+    members: list[dict[str, object]],
+    output_path: Path,
+    *,
+    thumbnail_size: tuple[int, int] = (180, 180),
+    columns: int = 4,
+) -> None:
+    if not members:
+        return
+
+    label_height = 54
+    cell_width = thumbnail_size[0] + 16
+    cell_height = thumbnail_size[1] + label_height + 16
+    rows = (len(members) + columns - 1) // columns
+    sheet = Image.new("RGBA", (columns * cell_width, rows * cell_height), (250, 250, 250, 255))
+    draw = ImageDraw.Draw(sheet)
+
+    for index, member in enumerate(members):
+        image_path = member.get("review_image")
+        if not isinstance(image_path, str):
+            continue
+
+        with Image.open(image_path) as source:
+            source.load()
+            tile = source.convert("RGBA")
+        tile.thumbnail(thumbnail_size)
+
+        column = index % columns
+        row = index // columns
+        origin_x = column * cell_width
+        origin_y = row * cell_height
+        image_x = origin_x + 8 + (thumbnail_size[0] - tile.width) // 2
+        image_y = origin_y + 8 + (thumbnail_size[1] - tile.height) // 2
+
+        draw.rectangle(
+            [
+                (origin_x + 4, origin_y + 4),
+                (origin_x + cell_width - 4, origin_y + cell_height - 4),
+            ],
+            outline=(180, 180, 180, 255),
+            width=1,
+        )
+        sheet.paste(tile, (image_x, image_y), tile)
+
+        label = f"{member.get('representative_name', 'item')}\n{member.get('logical_id', '')[-12:]}"
+        draw.multiline_text(
+            (origin_x + 8, origin_y + thumbnail_size[1] + 10),
+            label,
+            fill=(0, 0, 0, 255),
+            spacing=2,
+        )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    sheet.save(output_path)
+
+
+def materialize_review_candidates(
+    similarity_report: dict[str, object],
+    logical_groups: list[LogicalGroup],
+    logical_store_dir: Path,
+) -> tuple[Path, dict[str, object]]:
+    review_root = logical_store_dir / "review_candidates"
+    groups_dir = review_root / "groups"
+    manifest_path = review_root / "review_groups.json"
+
+    if review_root.exists():
+        shutil.rmtree(review_root)
+    groups_dir.mkdir(parents=True, exist_ok=True)
+
+    logical_group_by_id = {group.logical_id: group for group in logical_groups}
+    logical_id_by_exact_id: dict[str, str] = {}
+    for group in logical_groups:
+        for exact_id in group.member_exact_ids:
+            logical_id_by_exact_id[exact_id] = group.logical_id
+
+    review_component_members: list[list[str]] = []
+    review_components = similarity_report.get("review_components")
+    if isinstance(review_components, list):
+        for component in review_components:
+            if not isinstance(component, dict):
+                continue
+            member_exact_ids = component.get("member_exact_ids")
+            if not isinstance(member_exact_ids, list):
+                continue
+            logical_ids = sorted_unique_strings(
+                logical_id_by_exact_id[exact_id]
+                for exact_id in member_exact_ids
+                if isinstance(exact_id, str) and exact_id in logical_id_by_exact_id
+            )
+            if len(logical_ids) > 1:
+                review_component_members.append(logical_ids)
+    else:
+        review_candidates = similarity_report.get("review_candidates")
+        if isinstance(review_candidates, list):
+            for candidate in review_candidates:
+                if not isinstance(candidate, dict):
+                    continue
+                left = candidate.get("left")
+                right = candidate.get("right")
+                if not isinstance(left, dict) or not isinstance(right, dict):
+                    continue
+                left_exact_id = left.get("exact_id")
+                right_exact_id = right.get("exact_id")
+                if not isinstance(left_exact_id, str) or not isinstance(right_exact_id, str):
+                    continue
+                left_logical_id = logical_id_by_exact_id.get(left_exact_id)
+                right_logical_id = logical_id_by_exact_id.get(right_exact_id)
+                if left_logical_id and right_logical_id and left_logical_id != right_logical_id:
+                    review_component_members.append(sorted([left_logical_id, right_logical_id]))
+
+    parent: dict[str, str] = {}
+
+    def find(value: str) -> str:
+        root = parent.setdefault(value, value)
+        if root != value:
+            parent[value] = find(root)
+        return parent[value]
+
+    def union(lhs: str, rhs: str) -> None:
+        left_root = find(lhs)
+        right_root = find(rhs)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    review_logical_ids: set[str] = set()
+    for logical_ids in review_component_members:
+        review_logical_ids.update(logical_ids)
+        leader = logical_ids[0]
+        for logical_id in logical_ids[1:]:
+            union(leader, logical_id)
+
+    clustered_logical_ids: defaultdict[str, list[str]] = defaultdict(list)
+    for logical_id in sorted(review_logical_ids):
+        clustered_logical_ids[find(logical_id)].append(logical_id)
+
+    review_groups = [
+        sorted(logical_ids)
+        for logical_ids in clustered_logical_ids.values()
+        if len(logical_ids) > 1
+    ]
+    review_groups.sort(key=lambda logical_ids: logical_ids[0])
+
+    exported_image_count = 0
+    manifest_groups: list[dict[str, object]] = []
+    for index, logical_ids in enumerate(review_groups, start=1):
+        representative_name = logical_group_by_id[logical_ids[0]].representative_name
+        group_name = f"group_{index:04d}__{len(logical_ids):02d}_items__{sanitize_name(representative_name)}"
+        group_dir = groups_dir / group_name
+        members_dir = group_dir / "images"
+        members_dir.mkdir(parents=True, exist_ok=True)
+
+        member_records: list[dict[str, object]] = []
+        member_exact_ids: list[str] = []
+        fixtures: list[str] = []
+        source_images: list[str] = []
+        for member_index, logical_id in enumerate(logical_ids, start=1):
+            group = logical_group_by_id[logical_id]
+            source_logical_image = logical_store_dir / "images" / f"{logical_id}.png"
+            review_image_path: str | None = None
+            if source_logical_image.exists():
+                filename = (
+                    f"{member_index:02d}__{sanitize_name(group.representative_name)}__{logical_id}.png"
+                )
+                destination = members_dir / filename
+                link_or_copy_file(source_logical_image, destination)
+                review_image_path = str(destination)
+                exported_image_count += 1
+
+            member_records.append(
+                {
+                    "logical_id": group.logical_id,
+                    "representative_name": group.representative_name,
+                    "representative_exact_id": group.representative_exact_id,
+                    "representative_source_image": group.representative_source_image,
+                    "review_image": review_image_path,
+                    "member_exact_ids": group.member_exact_ids,
+                    "occurrence_count": group.occurrence_count,
+                    "fixtures": group.fixtures,
+                    "source_images": group.source_images,
+                    "merged_by_similarity": group.merged_by_similarity,
+                }
+            )
+            member_exact_ids.extend(group.member_exact_ids)
+            fixtures.extend(group.fixtures)
+            source_images.extend(group.source_images)
+
+        contact_sheet_path = group_dir / "contact_sheet.png"
+        create_review_contact_sheet(member_records, contact_sheet_path)
+
+        group_manifest = {
+            "group_id": group_name,
+            "logical_id_count": len(logical_ids),
+            "member_exact_id_count": len(sorted_unique_strings(member_exact_ids)),
+            "member_occurrence_count": sum(
+                int(member["occurrence_count"]) for member in member_records if isinstance(member.get("occurrence_count"), int)
+            ),
+            "fixtures": sorted_unique_strings(fixtures),
+            "source_images": sorted_unique_strings(source_images),
+            "contact_sheet": str(contact_sheet_path),
+            "members": member_records,
+        }
+        write_json(group_dir / "group.json", group_manifest)
+        manifest_groups.append(
+            {
+                "group_id": group_name,
+                "path": str(group_dir),
+                "contact_sheet": str(contact_sheet_path),
+                "logical_id_count": group_manifest["logical_id_count"],
+                "member_exact_id_count": group_manifest["member_exact_id_count"],
+                "member_occurrence_count": group_manifest["member_occurrence_count"],
+                "fixtures": group_manifest["fixtures"],
+                "source_images": group_manifest["source_images"],
+            }
+        )
+
+    manifest = {
+        "review_candidate_pair_count": similarity_report.get("review_candidate_count", 0),
+        "review_component_count": len(review_groups),
+        "review_candidate_image_count": exported_image_count,
+        "review_groups": manifest_groups,
+    }
+    write_json(manifest_path, manifest)
+    return review_root, manifest
 
 
 def build_occurrence_remap(
@@ -1129,6 +1364,11 @@ def main() -> int:
     )
     logical_group_metadata_path = effective_logical_store_dir / "metadata" / "logical_groups.json"
     write_json(logical_group_metadata_path, {"logical_groups": logical_group_metadata})
+    review_candidates_dir, review_manifest = materialize_review_candidates(
+        similarity_report,
+        logical_groups,
+        effective_logical_store_dir,
+    )
 
     write_json(pack_manifest_path, {"items": logical_pack_items})
 
@@ -1198,11 +1438,16 @@ def main() -> int:
         "duplicate_exact_ids": duplicate_summary,
         "similarity_report_json": str(similarity_report_path),
         "logical_group_metadata_json": str(logical_group_metadata_path),
+        "review_candidates_dir": str(review_candidates_dir),
+        "review_candidate_manifest_json": str(review_candidates_dir / "review_groups.json"),
         "occurrence_remap_json": str(occurrence_remap_path),
         "similarity_candidate_counts": {
             "auto_duplicate_candidates": similarity_report["auto_duplicate_candidate_count"],
             "review_candidates": similarity_report["review_candidate_count"],
             "auto_duplicate_components": similarity_report.get("auto_duplicate_component_count", 0),
+            "review_components": similarity_report.get("review_component_count", 0),
+            "review_candidate_images": review_manifest["review_candidate_image_count"],
+            "review_candidate_groups": review_manifest["review_component_count"],
         },
         "timing_seconds": {
             "sources": source_stage_duration,
@@ -1232,6 +1477,13 @@ def main() -> int:
         "Similarity report: %d high-confidence candidate pair(s), %d review pair(s).",
         similarity_report["auto_duplicate_candidate_count"],
         similarity_report["review_candidate_count"],
+    )
+    LOGGER.info(
+        "Review candidates: %d pair(s), %d cluster folder(s), %d linked image(s), folder=%s",
+        review_manifest["review_candidate_pair_count"],
+        review_manifest["review_component_count"],
+        review_manifest["review_candidate_image_count"],
+        review_candidates_dir,
     )
     LOGGER.info("Summary: %s", summary_path)
     return 0

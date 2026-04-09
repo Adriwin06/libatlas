@@ -427,8 +427,8 @@ picojson::value to_json_similarity_pair(const SimilarityPairRecord& pair,
   return picojson::value(object);
 }
 
-picojson::value to_json_auto_component(const std::vector<std::size_t>& component,
-                                       const std::vector<SimilarityReportGroup>& groups) {
+picojson::value to_json_similarity_component(const std::vector<std::size_t>& component,
+                                             const std::vector<SimilarityReportGroup>& groups) {
   picojson::object object;
   picojson::array exact_ids;
   picojson::array fixtures;
@@ -846,6 +846,7 @@ void run_similarity_report(const SimilarityReportCommand& command) {
   std::size_t auto_pair_count = 0;
   std::size_t review_pair_count = 0;
   DisjointSet auto_components(groups.size());
+  DisjointSet review_components(groups.size());
 
   for (std::size_t left_index = 0; left_index < groups.size(); ++left_index) {
     for (std::size_t right_index = left_index + 1; right_index < groups.size(); ++right_index) {
@@ -866,6 +867,7 @@ void run_similarity_report(const SimilarityReportCommand& command) {
         ++auto_pair_count;
         retain_top_pair(auto_pairs, std::move(pair), command.max_pairs, groups);
       } else {
+        review_components.unite(left_index, right_index);
         ++review_pair_count;
         retain_top_pair(review_pairs, std::move(pair), command.max_pairs, groups);
       }
@@ -918,7 +920,36 @@ void run_similarity_report(const SimilarityReportCommand& command) {
   std::size_t merged_exact_id_count = 0;
   for (const auto& component : auto_duplicate_components) {
     merged_exact_id_count += component.size();
-    auto_components_json.emplace_back(to_json_auto_component(component, groups));
+    auto_components_json.emplace_back(to_json_similarity_component(component, groups));
+  }
+
+  std::map<std::size_t, std::vector<std::size_t>> review_component_indices;
+  for (std::size_t index = 0; index < groups.size(); ++index) {
+    review_component_indices[review_components.find(index)].push_back(index);
+  }
+
+  std::vector<std::vector<std::size_t>> review_duplicate_components;
+  for (auto& entry : review_component_indices) {
+    if (entry.second.size() <= 1) {
+      continue;
+    }
+    std::sort(
+        entry.second.begin(),
+        entry.second.end(),
+        [&groups](std::size_t lhs, std::size_t rhs) { return groups[lhs].exact_id < groups[rhs].exact_id; });
+    review_duplicate_components.push_back(std::move(entry.second));
+  }
+  std::sort(review_duplicate_components.begin(),
+            review_duplicate_components.end(),
+            [&groups](const std::vector<std::size_t>& lhs, const std::vector<std::size_t>& rhs) {
+              return groups[lhs.front()].exact_id < groups[rhs.front()].exact_id;
+            });
+
+  picojson::array review_components_json;
+  std::size_t review_component_exact_id_count = 0;
+  for (const auto& component : review_duplicate_components) {
+    review_component_exact_id_count += component.size();
+    review_components_json.emplace_back(to_json_similarity_component(component, groups));
   }
 
   picojson::object library_defaults;
@@ -965,7 +996,12 @@ void run_similarity_report(const SimilarityReportCommand& command) {
       picojson::value(static_cast<double>(auto_duplicate_components.size()));
   output_root["auto_duplicate_component_exact_id_count"] =
       picojson::value(static_cast<double>(merged_exact_id_count));
+  output_root["review_component_count"] =
+      picojson::value(static_cast<double>(review_duplicate_components.size()));
+  output_root["review_component_exact_id_count"] =
+      picojson::value(static_cast<double>(review_component_exact_id_count));
   output_root["auto_duplicate_components"] = picojson::value(auto_components_json);
+  output_root["review_components"] = picojson::value(review_components_json);
   output_root["auto_duplicate_candidates"] = picojson::value(auto_pairs_json);
   output_root["review_candidates"] = picojson::value(review_pairs_json);
 
